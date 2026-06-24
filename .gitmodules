@@ -1,0 +1,3 @@
+[submodule "external/SysDVR-UpscalerBridge"]
+	path = external/SysDVR-UpscalerBridge
+	url = https://github.com/ChagataiDuru/SysDVR-UpscalerBridge.git
