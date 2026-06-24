@@ -86,3 +86,34 @@ TEST_CASE("FrameQueue stop wakes producer and consumer") {
     CHECK_FALSE(consumer.get().has_value());
 }
 
+
+TEST_CASE("FrameQueue latest policy drops oldest unpublished frame when full") {
+    ns60::FramePool pool(2, 16, 16);
+    ns60::FrameQueue queue(pool);
+
+    auto first = queue.acquireWriteLatest();
+    REQUIRE(first);
+    pool.at(*first).metadata.frameNumber = 1;
+    queue.commitWrite(*first);
+
+    auto second = queue.acquireWriteLatest();
+    REQUIRE(second);
+    pool.at(*second).metadata.frameNumber = 2;
+    queue.commitWrite(*second);
+
+    auto replacement = queue.acquireWriteLatest();
+    REQUIRE(replacement);
+    pool.at(*replacement).metadata.frameNumber = 3;
+    queue.commitWrite(*replacement);
+
+    CHECK(queue.staleDropCount() == 1);
+    auto read = queue.acquireRead();
+    REQUIRE(read);
+    CHECK(pool.at(*read).metadata.frameNumber == 2);
+    queue.releaseRead(*read);
+
+    read = queue.acquireRead();
+    REQUIRE(read);
+    CHECK(pool.at(*read).metadata.frameNumber == 3);
+    queue.releaseRead(*read);
+}

@@ -4,6 +4,7 @@ add_executable(ns60_tests
   PlaybackClockTests.cpp
   ColorMathTests.cpp
   MetricsTests.cpp
+  SysDvrBridgeProtocolTests.cpp
   UpscalingTests.cpp
   AppConfigTests.cpp)
 target_link_libraries(ns60_tests PRIVATE ns60_core doctest::doctest)

@@ -11,8 +11,13 @@
 namespace ns60 {
 
 enum class LogLevel { Trace, Debug, Info, Warning, Error, Critical };
+enum class SourceKind { File, SysDvrPipe, SysDvr };
+
 struct AppConfig {
+    SourceKind source{SourceKind::File};
     std::filesystem::path input;
+    std::string pipeName{"SysDVR-Upscaler.Video"};
+    std::filesystem::path sysdvrBridge;
     int outputWidth{1920};
     int outputHeight{1080};
     UpscaleMode upscale{UpscaleMode::Bilinear};
@@ -44,6 +49,6 @@ struct ParseResult {
 [[nodiscard]] ParseResult parseCommandLine(const std::vector<std::string>& args, bool defaultValidation);
 [[nodiscard]] std::string commandLineHelp();
 [[nodiscard]] const char* toString(LogLevel level) noexcept;
+[[nodiscard]] std::string_view toString(SourceKind source) noexcept;
 
 } // namespace ns60
-

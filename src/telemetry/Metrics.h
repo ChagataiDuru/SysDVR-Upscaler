@@ -39,7 +39,7 @@ struct Metrics {
  RollingMetric<> activeFrameTimeMs,presentSubmissionIntervalMs;
  RollingMetric<> gpuUploadMs,gpuColorMs;std::array<RollingMetric<>,static_cast<std::size_t>(GpuPass::Count)> gpuPassMs;
  RollingMetric<> gpuReconstructionMs,gpuPostProcessingMs,gpuPresentMs,gpuTotalMs;
- std::uint64_t decodedFrames{},presentedFrames{},presentSubmissions{},droppedFrames{},repeatedFrames{},lateFrames{};std::size_t queueOccupancy{},queueHighWater{};
+ std::uint64_t decodedFrames{},presentedFrames{},presentSubmissions{},droppedFrames{},repeatedFrames{},lateFrames{},staleDecodedFramesDropped{};std::size_t queueOccupancy{},queueHighWater{};
  double activePlaybackSeconds{};
  void resetActivePlayback() noexcept { activeFrameTimeMs.clear(); presentSubmissionIntervalMs.clear(); presentedFps.clear(); activePlaybackSeconds = 0.0; presentedFrames = 0; }
 };

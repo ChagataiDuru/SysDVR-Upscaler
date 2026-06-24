@@ -18,6 +18,7 @@ add_library(ns60_core
   src/app/AppConfig.cpp
   src/decode/FramePool.cpp
   src/decode/FrameQueue.cpp
+  src/decode/SysDvrBridgeProtocol.cpp
   src/playback/PlaybackClock.cpp
   src/render/Upscaling.cpp
   src/telemetry/Metrics.cpp
@@ -39,6 +40,7 @@ if(NS60_BUILD_APP)
     src/app/Application.cpp
     src/decode/FFmpegRuntime.cpp
     src/decode/FFmpegVideoReader.cpp
+    src/decode/SysDvrPipeSource.cpp
     src/platform/Window.cpp
     src/render/FidelityFxConstants.cpp
     src/render/VulkanContext.cpp
@@ -72,3 +74,9 @@ if(NS60_BUILD_TESTS)
   add_subdirectory(tests)
 endif()
 
+
+
+add_custom_target(build_sysdvr_upscaler_bridge
+  COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/scripts/build-sysdvr-upscaler-bridge.ps1"
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+  COMMENT "Publishing SysDVR-UpscalerBridge to artifacts/sysdvr-upscaler-bridge/win-x64")
