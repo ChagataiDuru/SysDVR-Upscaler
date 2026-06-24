@@ -1,0 +1,15 @@
+/build/
+/out/
+/.vs/
+/.vscode/
+/CMakeUserPresets.json
+/captures/
+/samples/
+/artifacts/
+*.obj
+*.user
+*.suo
+*.pdb
+*.ilk
+*.log
+

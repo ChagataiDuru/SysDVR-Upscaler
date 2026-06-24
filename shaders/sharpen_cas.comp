@@ -1,0 +1,13 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+// Adapter around official AMD FidelityFX CAS 1.20190610.
+layout(local_size_x=16,local_size_y=16) in;
+layout(set=0,binding=0) uniform sampler2D sourceImage;
+layout(rgba16f,set=0,binding=1) uniform writeonly image2D destinationImage;
+layout(push_constant) uniform Parameters { uvec4 con0;uvec4 con1;ivec2 outputExtent; } p;
+#define A_GPU 1
+#define A_GLSL 1
+#include "ffx_a.h"
+AF3 CasLoad(ASU2 q){return texelFetch(sourceImage,clamp(ivec2(q),ivec2(0),p.outputExtent-1),0).rgb;} void CasInput(inout AF1 r,inout AF1 g,inout AF1 b){}
+#include "ffx_cas.h"
+void main(){AU2 d=AU2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(d,AU2(p.outputExtent))))return;AF3 c;CasFilter(c.r,c.g,c.b,d,p.con0,p.con1,true);imageStore(destinationImage,ASU2(d),AF4(c,1));}

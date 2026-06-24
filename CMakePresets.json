@@ -1,0 +1,56 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "windows-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "architecture": { "value": "x64", "strategy": "external" },
+      "cacheVariables": {
+        "CMAKE_CXX_STANDARD": "20",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      },
+      "environment": {
+        "VCPKG_ROOT": "$penv{VCPKG_ROOT}"
+      },
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+    },
+    {
+      "name": "win-debug",
+      "inherits": "windows-base",
+      "displayName": "Windows x64 Debug",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "NS60_ENABLE_VALIDATION": "ON" }
+    },
+    {
+      "name": "win-release",
+      "inherits": "windows-base",
+      "displayName": "Windows x64 Release",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "NS60_ENABLE_VALIDATION": "OFF" }
+    },
+    {
+      "name": "core-tests",
+      "inherits": "windows-base",
+      "displayName": "Dependency-light core tests",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "NS60_BUILD_APP": "OFF",
+        "NS60_BUILD_TESTS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "win-debug", "configurePreset": "win-debug" },
+    { "name": "win-release", "configurePreset": "win-release" },
+    { "name": "core-tests", "configurePreset": "core-tests" }
+  ],
+  "testPresets": [
+    {
+      "name": "core-tests",
+      "configurePreset": "core-tests",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}
+

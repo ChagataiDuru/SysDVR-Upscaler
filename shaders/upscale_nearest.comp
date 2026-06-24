@@ -1,0 +1,6 @@
+#version 450
+layout(local_size_x=16,local_size_y=16) in;
+layout(set=0,binding=0) uniform sampler2D sourceImage;
+layout(rgba16f,set=0,binding=1) uniform writeonly image2D destinationImage;
+layout(push_constant) uniform Parameters { ivec2 outputExtent; ivec2 sourceExtent; int antiRinging; } p;
+void main(){ivec2 d=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(d,p.outputExtent)))return;vec2 s=(vec2(d)+0.5)*vec2(p.sourceExtent)/vec2(p.outputExtent)-0.5;imageStore(destinationImage,d,texelFetch(sourceImage,clamp(ivec2(floor(s+0.5)),ivec2(0),p.sourceExtent-1),0));}

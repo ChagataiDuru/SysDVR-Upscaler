@@ -1,0 +1,19 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(set = 0, binding = 0) uniform sampler2D sourceImage;
+layout(rgba16f, set = 0, binding = 1) uniform writeonly image2D destinationImage;
+
+layout(push_constant) uniform UpscaleParameters {
+    ivec2 outputExtent;
+} upscale;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, upscale.outputExtent))) return;
+    // Output pixel centers map to normalized source coordinates; the sampler's
+    // linear filter performs the four-tap bilinear reconstruction.
+    vec2 uv = (vec2(pixel) + vec2(0.5)) / vec2(upscale.outputExtent);
+    imageStore(destinationImage, pixel, texture(sourceImage, uv));
+}
+

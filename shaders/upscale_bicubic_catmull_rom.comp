@@ -1,0 +1,8 @@
+#version 450
+layout(local_size_x=16,local_size_y=16) in;
+layout(set=0,binding=0) uniform sampler2D sourceImage;
+layout(rgba16f,set=0,binding=1) uniform writeonly image2D destinationImage;
+layout(push_constant) uniform Parameters { ivec2 outputExtent; ivec2 sourceExtent; int antiRinging; } p;
+float w(float x){x=abs(x);if(x<1.0)return 1.5*x*x*x-2.5*x*x+1.0;if(x<2.0)return-0.5*x*x*x+2.5*x*x-4.0*x+2.0;return 0.0;}
+vec3 loadAt(ivec2 q){return texelFetch(sourceImage,clamp(q,ivec2(0),p.sourceExtent-1),0).rgb;}
+void main(){ivec2 d=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(d,p.outputExtent)))return;vec2 s=(vec2(d)+0.5)*vec2(p.sourceExtent)/vec2(p.outputExtent)-0.5;ivec2 b=ivec2(floor(s));vec2 f=s-vec2(b);vec3 c=vec3(0);float sum=0;for(int y=-1;y<=2;++y)for(int x=-1;x<=2;++x){float k=w(float(x)-f.x)*w(float(y)-f.y);c+=loadAt(b+ivec2(x,y))*k;sum+=k;}imageStore(destinationImage,d,vec4(c/max(sum,1e-8),1));}

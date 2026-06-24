@@ -1,0 +1,163 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(set = 0, binding = 0) uniform sampler2D yTexture;
+layout(set = 0, binding = 1) uniform sampler2D uTexture;
+layout(set = 0, binding = 2) uniform sampler2D vTexture;
+layout(rgba16f, set = 0, binding = 3) uniform writeonly image2D rgbOutput;
+
+layout(push_constant) uniform ColorParameters {
+    ivec2 extent;
+    int limitedRange;
+    int matrix; // 0=BT.601, 1=BT.709, 2=BT.2020 NCL
+    int chromaMode; // 0=bilinear, 1=bicubic, 2=lanczos2, 3=edge-aware
+    int chromaLocation; // 0=left, 1=center fallback
+    int chromaAntiRinging;
+    int padding;
+} color;
+
+const float PI = 3.14159265358979323846;
+
+float fetchPlane(sampler2D tex, ivec2 q) {
+    ivec2 size = textureSize(tex, 0);
+    return texelFetch(tex, clamp(q, ivec2(0), size - 1), 0).r;
+}
+
+float cubicWeight(float x) {
+    x = abs(x);
+    if (x < 1.0) return 1.5 * x * x * x - 2.5 * x * x + 1.0;
+    if (x < 2.0) return -0.5 * x * x * x + 2.5 * x * x - 4.0 * x + 2.0;
+    return 0.0;
+}
+
+float sinc(float x) {
+    if (abs(x) < 1.0e-5) return 1.0;
+    float q = PI * x;
+    return sin(q) / q;
+}
+
+float lanczos2(float x) {
+    x = abs(x);
+    return x < 2.0 ? sinc(x) * sinc(x * 0.5) : 0.0;
+}
+
+vec2 chromaCoordinate(ivec2 pixel) {
+    if (color.chromaLocation == 1) {
+        return (vec2(pixel) - vec2(0.5)) * 0.5;
+    }
+    // MPEG/JPEG "left" 4:2:0: chroma is horizontally co-sited with the left
+    // luma sample and vertically centered between each luma row pair.
+    return vec2(float(pixel.x) * 0.5, (float(pixel.y) - 0.5) * 0.5);
+}
+
+float sampleBilinear(sampler2D tex, vec2 c) {
+    vec2 size = vec2(textureSize(tex, 0));
+    return texture(tex, (c + vec2(0.5)) / size).r;
+}
+
+float sampleBicubic(sampler2D tex, vec2 c) {
+    ivec2 base = ivec2(floor(c));
+    vec2 f = c - vec2(base);
+    float value = 0.0;
+    float sum = 0.0;
+    for (int y = -1; y <= 2; ++y) {
+        float wy = cubicWeight(float(y) - f.y);
+        for (int x = -1; x <= 2; ++x) {
+            float w = cubicWeight(float(x) - f.x) * wy;
+            value += fetchPlane(tex, base + ivec2(x, y)) * w;
+            sum += w;
+        }
+    }
+    return value / max(abs(sum), 1.0e-6);
+}
+
+float sampleLanczos2(sampler2D tex, vec2 c) {
+    ivec2 base = ivec2(floor(c));
+    vec2 f = c - vec2(base);
+    float value = 0.0;
+    float sum = 0.0;
+    float lo = 1.0e20;
+    float hi = -1.0e20;
+    for (int y = -1; y <= 2; ++y) {
+        float wy = lanczos2(float(y) - f.y);
+        for (int x = -1; x <= 2; ++x) {
+            float chromaTap = fetchPlane(tex, base + ivec2(x, y));
+            float w = lanczos2(float(x) - f.x) * wy;
+            value += chromaTap * w;
+            sum += w;
+            if (x >= 0 && x <= 1 && y >= 0 && y <= 1) {
+                lo = min(lo, chromaTap);
+                hi = max(hi, chromaTap);
+            }
+        }
+    }
+    value /= max(abs(sum), 1.0e-6);
+    return color.chromaAntiRinging != 0 ? clamp(value, lo, hi) : value;
+}
+
+float sampleDirectionalLinear(sampler2D tex, vec2 c, bool verticalEdge) {
+    ivec2 base = ivec2(floor(c));
+    vec2 f = c - vec2(base);
+    if (verticalEdge) {
+        int x = int(round(c.x));
+        return mix(fetchPlane(tex, ivec2(x, base.y)), fetchPlane(tex, ivec2(x, base.y + 1)), clamp(f.y, 0.0, 1.0));
+    }
+    int y = int(round(c.y));
+    return mix(fetchPlane(tex, ivec2(base.x, y)), fetchPlane(tex, ivec2(base.x + 1, y)), clamp(f.x, 0.0, 1.0));
+}
+
+float sampleEdgeAware(sampler2D tex, vec2 c, ivec2 pixel) {
+    float left = fetchPlane(yTexture, pixel + ivec2(-1, 0));
+    float right = fetchPlane(yTexture, pixel + ivec2(1, 0));
+    float up = fetchPlane(yTexture, pixel + ivec2(0, -1));
+    float down = fetchPlane(yTexture, pixel + ivec2(0, 1));
+    float gx = abs(right - left);
+    float gy = abs(down - up);
+    float strongest = max(gx, gy);
+    if (strongest < 0.018) return sampleBicubic(tex, c);
+    if (gx > gy * 1.35) return sampleDirectionalLinear(tex, c, true);
+    if (gy > gx * 1.35) return sampleDirectionalLinear(tex, c, false);
+    return sampleBilinear(tex, c);
+}
+
+float sampleChroma(sampler2D tex, vec2 c, ivec2 pixel) {
+    if (color.chromaMode == 1) return sampleBicubic(tex, c);
+    if (color.chromaMode == 2) return sampleLanczos2(tex, c);
+    if (color.chromaMode == 3) return sampleEdgeAware(tex, c, pixel);
+    return sampleBilinear(tex, c);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, color.extent))) return;
+
+    vec2 lumaSize = vec2(textureSize(yTexture, 0));
+    vec2 yUv = (vec2(pixel) + vec2(0.5)) / lumaSize;
+    vec2 c = chromaCoordinate(pixel);
+
+    float ySample = texture(yTexture, yUv).r;
+    float cbSample = sampleChroma(uTexture, c, pixel);
+    float crSample = sampleChroma(vTexture, c, pixel);
+    float y;
+    float cb;
+    float cr;
+    if (color.limitedRange != 0) {
+        y = (ySample - 16.0 / 255.0) * (255.0 / 219.0);
+        cb = (cbSample - 128.0 / 255.0) * (255.0 / 224.0);
+        cr = (crSample - 128.0 / 255.0) * (255.0 / 224.0);
+    } else {
+        y = ySample;
+        cb = cbSample - 128.0 / 255.0;
+        cr = crSample - 128.0 / 255.0;
+    }
+
+    vec4 coeff;
+    if (color.matrix == 0) coeff = vec4(1.4020, -0.344136, -0.714136, 1.7720);
+    else if (color.matrix == 2) coeff = vec4(1.4746, -0.164553, -0.571353, 1.8814);
+    else coeff = vec4(1.5748, -0.187324, -0.468124, 1.8556);
+
+    vec3 rgb = vec3(y + coeff.x * cr,
+                    y + coeff.y * cb + coeff.z * cr,
+                    y + coeff.w * cb);
+    imageStore(rgbOutput, pixel, vec4(clamp(rgb, 0.0, 1.0), 1.0));
+}
