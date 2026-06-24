@@ -67,3 +67,28 @@ TEST_CASE("CLI rejects invalid phase 1.5 options") {
     CHECK_FALSE(ns60::parseCommandLine({"app", "--input", "x", "--final-filter", "cubic"}, false).config);
     CHECK_FALSE(ns60::parseCommandLine({"app", "--input", "x", "--chroma-upscale", "edgy"}, false).config);
 }
+TEST_CASE("CLI parses SysDVR pipe source") {
+    const auto result = ns60::parseCommandLine({"app", "--source", "sysdvr-pipe", "--pipe-name", "SysDVR-Upscaler.Video",
+        "--presentation", "exact"}, false);
+    REQUIRE(result.config);
+    CHECK(static_cast<int>(result.config->source) == static_cast<int>(ns60::SourceKind::SysDvrPipe));
+    CHECK(result.config->pipeName == "SysDVR-Upscaler.Video");
+    CHECK(static_cast<int>(result.config->presentation) == static_cast<int>(ns60::PresentationMode::Exact));
+}
+
+TEST_CASE("CLI parses unified SysDVR launch") {
+    const auto result = ns60::parseCommandLine({"app", "--source", "sysdvr", "--sysdvr-bridge", ".\\artifacts\\sysdvr-upscaler-bridge\\win-x64\\SysDVR-Client.exe",
+        "--quality-preset", "balanced", "--fullscreen", "--borderless"}, false);
+    REQUIRE(result.config);
+    CHECK(static_cast<int>(result.config->source) == static_cast<int>(ns60::SourceKind::SysDvr));
+    CHECK(result.config->sysdvrBridge.filename() == "SysDVR-Client.exe");
+    CHECK(static_cast<int>(result.config->upscale) == static_cast<int>(ns60::UpscaleMode::Fsr1EasuRcas));
+    CHECK(result.config->fullscreen);
+    CHECK(result.config->borderless);
+}
+
+TEST_CASE("CLI rejects live-only option conflicts") {
+    CHECK_FALSE(ns60::parseCommandLine({"app", "--source", "sysdvr-pipe", "--input", "x.mp4"}, false).config);
+    CHECK_FALSE(ns60::parseCommandLine({"app", "--source", "sysdvr-pipe", "--loop"}, false).config);
+    CHECK_FALSE(ns60::parseCommandLine({"app", "--source", "sysdvr"}, false).config);
+}

@@ -26,7 +26,43 @@ std::optional<LogLevel> parseLogLevel(std::string_view text) {
     if(text=="warning"||text=="warn")return LogLevel::Warning; if(text=="error")return LogLevel::Error;
     if(text=="critical")return LogLevel::Critical; return std::nullopt;
 }
+std::optional<SourceKind> parseSourceKind(std::string_view text) {
+    if(text=="file") return SourceKind::File;
+    if(text=="sysdvr-pipe") return SourceKind::SysDvrPipe;
+    if(text=="sysdvr") return SourceKind::SysDvr;
+    return std::nullopt;
+}
 std::filesystem::path utf8Path(std::string_view text) { const auto* first=reinterpret_cast<const char8_t*>(text.data()); return std::filesystem::path(std::u8string(first,first+text.size())); }
+
+bool applyQualityPreset(std::string_view text, AppConfig& config) {
+    if(text=="balanced") {
+        config.upscale=UpscaleMode::Fsr1EasuRcas;
+        config.sharpen.casSharpness=0.35F;
+        config.sharpen.rcasSharpness=0.25F;
+        config.antiRinging=true;
+        config.chromaUpscale=ChromaUpscaleMode::BicubicCatmullRom;
+        config.finalFilter=FinalFilter::Bilinear;
+        return true;
+    }
+    if(text=="performance") {
+        config.upscale=UpscaleMode::BilinearCas;
+        config.sharpen.casSharpness=0.30F;
+        config.antiRinging=true;
+        config.chromaUpscale=ChromaUpscaleMode::Bilinear;
+        config.finalFilter=FinalFilter::Bilinear;
+        return true;
+    }
+    if(text=="quality") {
+        config.upscale=UpscaleMode::Fsr1EasuRcas;
+        config.sharpen.casSharpness=0.35F;
+        config.sharpen.rcasSharpness=0.20F;
+        config.antiRinging=true;
+        config.chromaUpscale=ChromaUpscaleMode::Lanczos2;
+        config.finalFilter=FinalFilter::Bilinear;
+        return true;
+    }
+    return false;
+}
 }
 
 ParseResult parseCommandLine(const std::vector<std::string>& args, bool defaultValidation) {
@@ -38,7 +74,11 @@ ParseResult parseCommandLine(const std::vector<std::string>& args, bool defaultV
         if(argument=="--version")return{ParseAction::Version,std::nullopt,{}};
         if(argument=="--loop"){config.loop=true;continue;} if(argument=="--fullscreen"){config.fullscreen=true;continue;}
         if(argument=="--borderless"){config.borderless=true;continue;} if(argument=="--drop-late-frames"){config.dropLateFrames=true;continue;}
-        if(argument=="--input") { const auto* value=requireValue(argument); if(!value||value->empty())return{ParseAction::Run,std::nullopt,"--input requires a path"}; config.input=utf8Path(*value);inputSeen=true; }
+        if(argument=="--source") { const auto* value=requireValue(argument);const auto parsed=value?parseSourceKind(*value):std::nullopt;if(!parsed)return{ParseAction::Run,std::nullopt,"--source requires file, sysdvr-pipe, or sysdvr"};config.source=*parsed; }
+        else if(argument=="--input") { const auto* value=requireValue(argument); if(!value||value->empty())return{ParseAction::Run,std::nullopt,"--input requires a path"}; config.input=utf8Path(*value);inputSeen=true; }
+        else if(argument=="--pipe-name") { const auto* value=requireValue(argument); if(!value||value->empty())return{ParseAction::Run,std::nullopt,"--pipe-name requires a non-empty pipe name"}; config.pipeName=*value; }
+        else if(argument=="--sysdvr-bridge") { const auto* value=requireValue(argument); if(!value||value->empty())return{ParseAction::Run,std::nullopt,"--sysdvr-bridge requires a path"}; config.sysdvrBridge=utf8Path(*value); }
+        else if(argument=="--quality-preset") { const auto* value=requireValue(argument); if(!value||!applyQualityPreset(*value,config))return{ParseAction::Run,std::nullopt,"--quality-preset requires balanced, performance, or quality"}; }
         else if(argument=="--width"||argument=="--height") { const auto* value=requireValue(argument);int parsed{};if(!value||!parsePositiveInt(*value,parsed))return{ParseAction::Run,std::nullopt,argument+" requires an integer in [1, 16384]"};(argument=="--width"?config.outputWidth:config.outputHeight)=parsed; }
         else if(argument=="--monitor") { const auto* value=requireValue(argument);int parsed{};if(!value||!parseNonNegativeInt(*value,parsed))return{ParseAction::Run,std::nullopt,"--monitor requires a non-negative integer monitor index"};config.monitorIndex=parsed; }
         else if(argument=="--upscale") { const auto* value=requireValue(argument);const auto parsed=value?parseUpscaleMode(*value):std::nullopt;if(!parsed)return{ParseAction::Run,std::nullopt,"Invalid --upscale mode (nearest, bilinear, bicubic, lanczos2, bilinear-cas, lanczos2-cas, fsr1-easu, fsr1-easu-rcas)"};config.upscale=*parsed; }
@@ -52,16 +92,31 @@ ParseResult parseCommandLine(const std::vector<std::string>& args, bool defaultV
         else if(!argument.empty()&&argument.front()!='-'&&!inputSeen){config.input=utf8Path(argument);inputSeen=true;}
         else return{ParseAction::Run,std::nullopt,"Unknown option: "+argument};
     }
-    if(!inputSeen)return{ParseAction::Run,std::nullopt,"Missing required --input <path>"}; if(config.borderless)config.fullscreen=true;
+    if(config.source==SourceKind::File&&!inputSeen)return{ParseAction::Run,std::nullopt,"Missing required --input <path>"};
+    if(config.source!=SourceKind::File&&inputSeen)return{ParseAction::Run,std::nullopt,"--input is only valid with --source file"};
+    if(config.source!=SourceKind::File&&config.loop)return{ParseAction::Run,std::nullopt,"--loop is only valid with file input"};
+    if(config.source==SourceKind::SysDvr&&config.sysdvrBridge.empty())return{ParseAction::Run,std::nullopt,"--source sysdvr requires --sysdvr-bridge <path>"};
+    if(config.pipeName.empty())return{ParseAction::Run,std::nullopt,"--pipe-name requires a non-empty pipe name"};
+    if(config.borderless)config.fullscreen=true;
     return{ParseAction::Run,std::move(config),{}};
 }
 
-std::string commandLineHelp() { return R"(NexusStream60 - offline SysDVR Vulkan upscaling laboratory
+std::string commandLineHelp() { return R"(NexusStream60 - offline and live SysDVR Vulkan upscaling laboratory
 
-Usage: NexusStream60.exe --input <video.mp4> [options]
+Usage:
+  NexusStream60.exe --input <video.mp4> [options]
+  NexusStream60.exe --source sysdvr-pipe --pipe-name <name> [options]
+  NexusStream60.exe --source sysdvr --sysdvr-bridge <SysDVR-Client.exe> [options]
 
-  --input <path>              Input MP4 (a positional path is also accepted)
+Input options:
+  --source <mode>             file|sysdvr-pipe|sysdvr (default file)
+  --input <path>              Input MP4 for file mode (a positional path is also accepted)
+  --pipe-name <name>          Named pipe for sysdvr-pipe mode (default SysDVR-Upscaler.Video)
+  --sysdvr-bridge <path>      SysDVR-Client executable for unified sysdvr mode
+
+Output and quality:
   --width/--height <pixels>   Reconstruction output/client framebuffer request (default 1920x1080)
+  --quality-preset <preset>   balanced|performance|quality
   --monitor <index>           Target monitor for fullscreen/borderless presentation
   --upscale <mode>            nearest|bilinear|bicubic|lanczos2|bilinear-cas|lanczos2-cas|fsr1-easu|fsr1-easu-rcas
   --cas-sharpness <0..1>      FidelityFX CAS strength (default 0.35)
@@ -76,4 +131,5 @@ Usage: NexusStream60.exe --input <video.mp4> [options]
   --help --version
 )"; }
 const char* toString(LogLevel level) noexcept { switch(level){case LogLevel::Trace:return"TRACE";case LogLevel::Debug:return"DEBUG";case LogLevel::Info:return"INFO";case LogLevel::Warning:return"WARNING";case LogLevel::Error:return"ERROR";case LogLevel::Critical:return"CRITICAL";}return"UNKNOWN"; }
+std::string_view toString(SourceKind source) noexcept { switch(source){case SourceKind::File:return"file";case SourceKind::SysDvrPipe:return"sysdvr-pipe";case SourceKind::SysDvr:return"sysdvr";}return"unknown"; }
 } // namespace ns60

@@ -22,6 +22,29 @@ std::optional<std::size_t> FrameQueue::acquireWrite() {
     return slot;
 }
 
+
+std::optional<std::size_t> FrameQueue::acquireWriteLatest() {
+    std::unique_lock lock(mutex_);
+    writable_.wait(lock, [this] {
+        return stopped_ || std::find(states_.begin(), states_.end(), SlotState::Free) != states_.end() || readyCount_ != 0;
+    });
+    if (stopped_) return std::nullopt;
+
+    const auto iterator = std::find(states_.begin(), states_.end(), SlotState::Free);
+    if (iterator != states_.end()) {
+        const auto slot = static_cast<std::size_t>(std::distance(states_.begin(), iterator));
+        states_[slot] = SlotState::Writing;
+        return slot;
+    }
+
+    const auto slot = readyRing_[readPos_];
+    readPos_ = (readPos_ + 1) % readyRing_.size();
+    --readyCount_;
+    if (states_[slot] != SlotState::Ready) throw std::logic_error("FrameQueue state corruption while dropping a stale frame");
+    states_[slot] = SlotState::Writing;
+    ++staleDrops_;
+    return slot;
+}
 void FrameQueue::commitWrite(std::size_t slot) {
     {
         std::lock_guard lock(mutex_);
@@ -83,5 +106,6 @@ void FrameQueue::stop() noexcept {
 bool FrameQueue::stopped() const noexcept { std::lock_guard lock(mutex_); return stopped_; }
 std::size_t FrameQueue::occupancy() const noexcept { std::lock_guard lock(mutex_); return readyCount_; }
 std::size_t FrameQueue::highWaterMark() const noexcept { std::lock_guard lock(mutex_); return highWater_; }
+std::size_t FrameQueue::staleDropCount() const noexcept { std::lock_guard lock(mutex_); return staleDrops_; }
 
 } // namespace ns60

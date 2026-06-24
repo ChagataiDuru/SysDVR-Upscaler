@@ -109,10 +109,11 @@ void ImGuiOverlay::build(const Metrics& metrics, const std::optional<VideoFrameM
             ImGui::Text("Rolling FPS (1s / 120 frames): %.2f / %.2f", fpsFromNewestIntervalWindow(metrics.presentSubmissionIntervalMs, 1000.0), fpsFromAverageInterval(metrics.presentSubmissionIntervalMs));
             ImGui::Text("Lifetime active presented FPS: %.2f", metrics.activePlaybackSeconds > 0.0 ? static_cast<double>(metrics.presentedFrames) / metrics.activePlaybackSeconds : 0.0);
             ImGui::Text("Decoder throughput FPS: %.2f", metrics.decodedFps.latest());
-            ImGui::Text("Queue: %zu / 4 (high-water %zu)", metrics.queueOccupancy, metrics.queueHighWater);
+            ImGui::Text("Decoded queue: %zu (high-water %zu)", metrics.queueOccupancy, metrics.queueHighWater);
             ImGui::Text("Dropped / repeated / late: %llu / %llu / %llu",
                 static_cast<unsigned long long>(metrics.droppedFrames), static_cast<unsigned long long>(metrics.repeatedFrames),
                 static_cast<unsigned long long>(metrics.lateFrames));
+            ImGui::Text("Stale decoded frames dropped: %llu", static_cast<unsigned long long>(metrics.staleDecodedFramesDropped));
             metricRow("Playback drift", metrics.driftMs);
             metricRow("Frame lateness", metrics.latenessMs);
             metricRow("CPU decode", metrics.decodeMs);

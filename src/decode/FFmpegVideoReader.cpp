@@ -1,11 +1,14 @@
 #include "decode/FFmpegVideoReader.h"
 
 #include "decode/FFmpegRuntime.h"
+#include "decode/SysDvrPipeSource.h"
 #include "utility/Log.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavutil/error.h>
+#include <libavutil/mem.h>
 #include <libavutil/pixdesc.h>
 }
 
@@ -13,6 +16,7 @@ extern "C" {
 #include <cstring>
 #include <format>
 #include <stdexcept>
+#include <utility>
 
 namespace ns60 {
 namespace {
@@ -27,20 +31,31 @@ double rational(AVRational value) noexcept {
     return value.den != 0 ? av_q2d(value) : 0.0;
 }
 
-ColorRange mapRange(AVColorRange range) {
+ColorRange mapRange(AVColorRange range, bool allowDefault) {
     if (range == AVCOL_RANGE_MPEG) return ColorRange::Limited;
     if (range == AVCOL_RANGE_JPEG) return ColorRange::Full;
+    if (allowDefault) return ColorRange::Limited;
     throw std::runtime_error("Input color range is unspecified. Phase 1 requires explicit limited/TV or full/JPEG metadata.");
 }
 
-ColorMatrix mapMatrix(AVColorSpace matrix) {
+ColorMatrix mapMatrix(AVColorSpace matrix, bool allowDefault) {
     switch (matrix) {
     case AVCOL_SPC_BT709: return ColorMatrix::Bt709;
     case AVCOL_SPC_BT470BG:
     case AVCOL_SPC_SMPTE170M: return ColorMatrix::Bt601;
     case AVCOL_SPC_BT2020_NCL: return ColorMatrix::Bt2020Ncl;
-    default: throw std::runtime_error("Unsupported or unspecified YUV matrix; Phase 1 accepts BT.601, BT.709, or BT.2020 NCL metadata");
+    default:
+        if (allowDefault) return ColorMatrix::Bt709;
+        throw std::runtime_error("Unsupported or unspecified YUV matrix; Phase 1 accepts BT.601, BT.709, or BT.2020 NCL metadata");
     }
+}
+
+AVColorRange bestRange(AVColorRange primary, AVColorRange fallback) noexcept {
+    return primary != AVCOL_RANGE_UNSPECIFIED ? primary : fallback;
+}
+
+AVColorSpace bestMatrix(AVColorSpace primary, AVColorSpace fallback) noexcept {
+    return primary != AVCOL_SPC_UNSPECIFIED ? primary : fallback;
 }
 
 void copyPlane(std::vector<std::byte>& output, int outputStride, const std::uint8_t* input,
@@ -55,6 +70,9 @@ void copyPlane(std::vector<std::byte>& output, int outputStride, const std::uint
 } // namespace
 
 struct FFmpegVideoReader::Impl {
+    std::unique_ptr<SysDvrPipeSource> pipeSource;
+    std::exception_ptr pipeError;
+    AVIOContext* customAvio{};
     std::unique_ptr<AVFormatContext, FormatDeleter> format;
     std::unique_ptr<AVCodecContext, CodecDeleter> codec;
     std::unique_ptr<AVPacket, PacketDeleter> packet{av_packet_alloc()};
@@ -63,23 +81,100 @@ struct FFmpegVideoReader::Impl {
     int streamIndex{-1};
     VideoStreamInfo streamInfo;
     bool draining{};
+    bool seekable{true};
+    bool allowMetadataDefaults{};
     std::uint64_t frameNumber{};
     std::int64_t lastPts{AV_NOPTS_VALUE};
     double fallbackPts{};
 
     explicit Impl(const std::filesystem::path& path) {
-        AVFormatContext* rawFormat{};
         const auto utf8 = path.u8string();
         const std::string filename(utf8.begin(), utf8.end());
+        openFile(filename);
+    }
+
+    explicit Impl(SysDvrPipeInput input) {
+        if (input.pipeName.empty()) throw std::invalid_argument("SysDVR pipe input requires a pipe name");
+        seekable = false;
+        allowMetadataDefaults = true;
+        openPipe(std::move(input.pipeName));
+    }
+
+    ~Impl() {
+        format.reset();
+        if (customAvio) {
+            av_freep(&customAvio->buffer);
+            avio_context_free(&customAvio);
+        }
+    }
+
+    static int readPipePacket(void* opaque, std::uint8_t* buffer, int bufferSize) noexcept {
+        auto* self = static_cast<Impl*>(opaque);
+        try {
+            const int bytes = self->pipeSource->read(buffer, bufferSize);
+            return bytes == 0 ? AVERROR_EOF : bytes;
+        } catch (...) {
+            if (!self->pipeError) self->pipeError = std::current_exception();
+            return AVERROR(EIO);
+        }
+    }
+
+    void openFile(const std::string& filename) {
+        AVFormatContext* rawFormat{};
         int result = avformat_open_input(&rawFormat, filename.c_str(), nullptr, nullptr);
         if (result < 0) throw std::runtime_error("Failed to open input '" + filename + "': " + ffmpegError(result));
         format.reset(rawFormat);
-        result = avformat_find_stream_info(format.get(), nullptr);
-        if (result < 0) throw std::runtime_error("Failed to read stream metadata for '" + filename + "': " + ffmpegError(result));
+        openDecoder("'" + filename + "'");
+    }
+
+    void openPipe(std::string pipeName) {
+        pipeSource = std::make_unique<SysDvrPipeSource>(std::move(pipeName));
+        auto* rawFormat = avformat_alloc_context();
+        if (!rawFormat) throw std::bad_alloc();
+
+        constexpr int avioBufferSize = 64 * 1024;
+        auto* avioBuffer = static_cast<std::uint8_t*>(av_malloc(avioBufferSize));
+        if (!avioBuffer) {
+            avformat_free_context(rawFormat);
+            throw std::bad_alloc();
+        }
+        customAvio = avio_alloc_context(avioBuffer, avioBufferSize, 0, this, readPipePacket, nullptr, nullptr);
+        if (!customAvio) {
+            av_free(avioBuffer);
+            avformat_free_context(rawFormat);
+            throw std::bad_alloc();
+        }
+
+        rawFormat->pb = customAvio;
+        rawFormat->flags |= AVFMT_FLAG_CUSTOM_IO;
+        const AVInputFormat* h264 = av_find_input_format("h264");
+        if (!h264) {
+            avformat_free_context(rawFormat);
+            throw std::runtime_error("FFmpeg h264 demuxer is unavailable");
+        }
+
+        AVFormatContext* opened = rawFormat;
+        const int result = avformat_open_input(&opened, "nexus-sysdvr-pipe.h264", h264, nullptr);
+        if (result < 0) {
+            if (pipeError) std::rethrow_exception(pipeError);
+            if (opened) avformat_free_context(opened);
+            throw std::runtime_error("Failed to open SysDVR pipe input: " + ffmpegError(result));
+        }
+        format.reset(opened);
+        openDecoder("SysDVR pipe '" + pipeSource->pipeName() + "'");
+    }
+
+    void openDecoder(const std::string& label) {
+        int result = avformat_find_stream_info(format.get(), nullptr);
+        if (result < 0) {
+            if (pipeError) std::rethrow_exception(pipeError);
+            throw std::runtime_error("Failed to read stream metadata for " + label + ": " + ffmpegError(result));
+        }
 
         const AVCodec* decoder{};
         streamIndex = av_find_best_stream(format.get(), AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
-        if (streamIndex < 0) throw std::runtime_error("No decodable video stream in '" + filename + "': " + ffmpegError(streamIndex));
+        if (streamIndex < 0) throw std::runtime_error("No decodable video stream in " + label + ": " + ffmpegError(streamIndex));
+        if (!decoder) throw std::runtime_error("FFmpeg did not provide an H.264 decoder for " + label);
         stream = format->streams[streamIndex];
         if (stream->codecpar->codec_id != AV_CODEC_ID_H264) {
             throw std::runtime_error("Unsupported codec '" + std::string(avcodec_get_name(stream->codecpar->codec_id)) + "'; Phase 1 requires H.264");
@@ -95,16 +190,21 @@ struct FFmpegVideoReader::Impl {
 
         const auto pixelFormat = static_cast<AVPixelFormat>(stream->codecpar->format);
         if (pixelFormat != AV_PIX_FMT_YUV420P && pixelFormat != AV_PIX_FMT_YUVJ420P && pixelFormat != AV_PIX_FMT_NONE) {
-            throw std::runtime_error("Unsupported input pixel format '" + std::string(av_get_pix_fmt_name(pixelFormat)) + "'; Phase 1 requires yuv420p/yuvj420p");
+            const char* name = av_get_pix_fmt_name(pixelFormat);
+            throw std::runtime_error("Unsupported input pixel format '" + std::string(name ? name : "unknown") + "'; Phase 1 requires yuv420p/yuvj420p");
         }
         if (codec->width <= 0 || codec->height <= 0 || (codec->width & 1) || (codec->height & 1)) {
             throw std::runtime_error("YUV420P input dimensions must be positive and even");
         }
 
-        const AVColorRange range = codec->color_range != AVCOL_RANGE_UNSPECIFIED ? codec->color_range : stream->codecpar->color_range;
-        const AVColorSpace matrix = codec->colorspace != AVCOL_SPC_UNSPECIFIED ? codec->colorspace : stream->codecpar->color_space;
+        const auto range = bestRange(codec->color_range, stream->codecpar->color_range);
+        const auto matrix = bestMatrix(codec->colorspace, stream->codecpar->color_space);
+        auto chromaLocation = stream->codecpar->chroma_location;
+        if (chromaLocation == AVCHROMA_LOC_UNSPECIFIED && allowMetadataDefaults) chromaLocation = AVCHROMA_LOC_LEFT;
+
+        const char* pixelName = pixelFormat == AV_PIX_FMT_NONE ? nullptr : av_get_pix_fmt_name(pixelFormat);
         streamInfo.codecName = decoder->name;
-        streamInfo.pixelFormatName = pixelFormat == AV_PIX_FMT_NONE ? "deferred" : av_get_pix_fmt_name(pixelFormat);
+        streamInfo.pixelFormatName = pixelName ? pixelName : "deferred";
         streamInfo.width = codec->width;
         streamInfo.height = codec->height;
         streamInfo.declaredFrameRate = rational(stream->r_frame_rate);
@@ -113,12 +213,12 @@ struct FFmpegVideoReader::Impl {
             ? static_cast<double>(stream->duration) * rational(stream->time_base)
             : (format->duration != AV_NOPTS_VALUE ? static_cast<double>(format->duration) / AV_TIME_BASE : 0.0);
         streamInfo.bitRate = stream->codecpar->bit_rate > 0 ? stream->codecpar->bit_rate : format->bit_rate;
-        streamInfo.color = {mapRange(range), mapMatrix(matrix)};
+        streamInfo.color = {mapRange(range, allowMetadataDefaults), mapMatrix(matrix, allowMetadataDefaults)};
         streamInfo.transfer = av_color_transfer_name(stream->codecpar->color_trc)
             ? av_color_transfer_name(stream->codecpar->color_trc) : "unspecified";
-        streamInfo.chromaLocation = av_chroma_location_name(stream->codecpar->chroma_location)
-            ? av_chroma_location_name(stream->codecpar->chroma_location) : "unspecified";
-        if (stream->codecpar->chroma_location != AVCHROMA_LOC_LEFT) {
+        streamInfo.chromaLocation = av_chroma_location_name(chromaLocation)
+            ? av_chroma_location_name(chromaLocation) : "unspecified";
+        if (chromaLocation != AVCHROMA_LOC_LEFT) {
             throw std::runtime_error("Unsupported chroma location '" + streamInfo.chromaLocation + "'; Phase 1 requires left-sited 4:2:0 chroma");
         }
     }
@@ -158,8 +258,8 @@ struct FFmpegVideoReader::Impl {
                 const auto copyEnd = Clock::now();
                 destination.metadata = {frame->width, frame->height, pts, ptsSeconds, duration, frameNumber++,
                     (frame->flags & AV_FRAME_FLAG_KEY) != 0,
-                    {mapRange(frame->color_range != AVCOL_RANGE_UNSPECIFIED ? frame->color_range : codec->color_range),
-                     mapMatrix(frame->colorspace != AVCOL_SPC_UNSPECIFIED ? frame->colorspace : codec->colorspace)}};
+                    {mapRange(bestRange(frame->color_range, codec->color_range), allowMetadataDefaults),
+                     mapMatrix(bestMatrix(frame->colorspace, codec->colorspace), allowMetadataDefaults)}};
                 timing.decodeMs = std::chrono::duration<double, std::milli>(decodedAt - operationStart).count();
                 timing.copyMs = std::chrono::duration<double, std::milli>(copyEnd - copyStart).count();
                 av_frame_unref(frame.get());
@@ -176,7 +276,10 @@ struct FFmpegVideoReader::Impl {
                 draining = true;
                 continue;
             }
-            if (result < 0) throw std::runtime_error("MP4 demux failed: " + ffmpegError(result));
+            if (result < 0) {
+                if (pipeError) std::rethrow_exception(pipeError);
+                throw std::runtime_error("H.264 demux failed: " + ffmpegError(result));
+            }
             if (packet->stream_index == streamIndex) {
                 result = avcodec_send_packet(codec.get(), packet.get());
                 av_packet_unref(packet.get());
@@ -188,6 +291,10 @@ struct FFmpegVideoReader::Impl {
     }
 
     void seek() {
+        if (!seekable) {
+            Log::warning("Ignoring seek request for live SysDVR pipe input");
+            return;
+        }
         const std::int64_t target = stream->start_time != AV_NOPTS_VALUE ? stream->start_time : 0;
         const int result = av_seek_frame(format.get(), streamIndex, target, AVSEEK_FLAG_BACKWARD);
         if (result < 0) throw std::runtime_error("Failed to seek input to the beginning: " + ffmpegError(result));
@@ -203,6 +310,7 @@ struct FFmpegVideoReader::Impl {
 };
 
 FFmpegVideoReader::FFmpegVideoReader(const std::filesystem::path& path) : impl_(std::make_unique<Impl>(path)) {}
+FFmpegVideoReader::FFmpegVideoReader(SysDvrPipeInput input) : impl_(std::make_unique<Impl>(std::move(input))) {}
 FFmpegVideoReader::~FFmpegVideoReader() = default;
 FFmpegVideoReader::FFmpegVideoReader(FFmpegVideoReader&&) noexcept = default;
 FFmpegVideoReader& FFmpegVideoReader::operator=(FFmpegVideoReader&&) noexcept = default;

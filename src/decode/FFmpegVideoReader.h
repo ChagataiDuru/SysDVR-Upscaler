@@ -9,6 +9,10 @@
 
 namespace ns60 {
 
+struct SysDvrPipeInput {
+    std::string pipeName;
+};
+
 struct VideoStreamInfo {
     std::string codecName;
     std::string pixelFormatName;
@@ -33,6 +37,7 @@ enum class ReadFrameResult { Frame, EndOfFile };
 class FFmpegVideoReader final {
 public:
     explicit FFmpegVideoReader(const std::filesystem::path& path);
+    explicit FFmpegVideoReader(SysDvrPipeInput input);
     ~FFmpegVideoReader();
     FFmpegVideoReader(const FFmpegVideoReader&) = delete;
     FFmpegVideoReader& operator=(const FFmpegVideoReader&) = delete;
@@ -49,4 +54,3 @@ private:
 };
 
 } // namespace ns60
-

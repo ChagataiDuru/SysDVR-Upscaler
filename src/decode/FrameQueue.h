@@ -21,6 +21,7 @@ public:
     FrameQueue& operator=(const FrameQueue&) = delete;
 
     [[nodiscard]] std::optional<std::size_t> acquireWrite();
+    [[nodiscard]] std::optional<std::size_t> acquireWriteLatest();
     void commitWrite(std::size_t slot);
     void cancelWrite(std::size_t slot);
     [[nodiscard]] std::optional<std::size_t> acquireRead();
@@ -29,6 +30,7 @@ public:
     [[nodiscard]] bool stopped() const noexcept;
     [[nodiscard]] std::size_t occupancy() const noexcept;
     [[nodiscard]] std::size_t highWaterMark() const noexcept;
+    [[nodiscard]] std::size_t staleDropCount() const noexcept;
     [[nodiscard]] FramePool& pool() noexcept { return pool_; }
 
 private:
@@ -43,6 +45,7 @@ private:
     std::size_t writePos_{};
     std::size_t readyCount_{};
     std::size_t highWater_{};
+    std::size_t staleDrops_{};
     bool stopped_{};
 };
 
