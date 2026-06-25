@@ -1,6 +1,6 @@
-# NexusStream60
+# SysDVR-Upscaler
 
-NexusStream60 is a Windows-first C++20/Vulkan laboratory for decoding recorded Nintendo Switch SysDVR MP4 video, performing explicit YUV color conversion, and comparing low-latency spatial upscalers. Phase 1 is an offline, timestamp-correct vertical slice: H.264 software decode, owned YUV420P frames, BT.709 conversion, bilinear 720p-to-1080p compute upscale, presentation, telemetry, and screenshots.
+SysDVR-Upscaler is a Windows-first C++20/Vulkan laboratory for decoding recorded Nintendo Switch SysDVR MP4 video, performing explicit YUV color conversion, and comparing low-latency spatial upscalers. Phase 1 is an offline, timestamp-correct vertical slice: H.264 software decode, owned YUV420P frames, BT.709 conversion, bilinear 720p-to-1080p compute upscale, presentation, telemetry, and screenshots.
 
 USB/SysDVR protocol ingestion, live timing reconstruction, audio, hardware decoding, networking, decoder/GPU zero-copy, SPS patching, and advanced/temporal upscalers are deliberately out of scope.
 
