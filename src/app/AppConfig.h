@@ -1,5 +1,6 @@
 #pragma once
 
+#include "decode/DecoderBackend.h"
 #include "render/Upscaling.h"
 
 #include <filesystem>
@@ -17,6 +18,7 @@ enum class LatencyProfile { Quality, Balanced, Ultra };
 
 struct AppConfig {
     SourceKind source{SourceKind::File};
+    DecoderBackend decoderBackend{DecoderBackend::Software};
     LatencyProfile latencyProfile{LatencyProfile::Balanced};
     std::filesystem::path input;
     std::string pipeName{"SysDVR-Upscaler.Video"};
@@ -46,7 +48,7 @@ struct AppConfig {
     LogLevel logLevel{LogLevel::Info};
 };
 
-enum class ParseAction { Run, Help, Version };
+enum class ParseAction { Run, Help, Version, ListDecoders, DecoderCapabilities };
 struct ParseResult {
     ParseAction action{ParseAction::Run};
     std::optional<AppConfig> config;

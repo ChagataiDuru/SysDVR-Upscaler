@@ -67,6 +67,7 @@ void ImGuiOverlay::build(const Metrics& metrics, const std::optional<VideoFrameM
             const auto filename = input_.filename().string();
             ImGui::Text("Input: %s", filename.c_str());
             ImGui::Text("Codec / format: %s / %s", stream_.codecName.c_str(), stream_.pixelFormatName.c_str());
+            ImGui::Text("Decoder backend: %s", toString(stream_.activeDecoderBackend).data());
             ImGui::Text("Input / output: %dx%d / %dx%d", stream_.width, stream_.height, outputWidth_, outputHeight_);
             ImGui::Text("Color: %s, %s, transfer %s", toString(stream_.color.range), toString(stream_.color.matrix), stream_.transfer.c_str());
             if (stream_.live) {

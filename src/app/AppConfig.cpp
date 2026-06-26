@@ -43,6 +43,12 @@ std::optional<LatencyProfile> parseLatencyProfile(std::string_view text) {
     if(text=="ultra") return LatencyProfile::Ultra;
     return std::nullopt;
 }
+std::optional<DecoderBackend> parseDecoderBackend(std::string_view text) {
+    if(text=="software"||text=="sw") return DecoderBackend::Software;
+    if(text=="d3d11va"||text=="d3d11") return DecoderBackend::D3D11VA;
+    if(text=="auto") return DecoderBackend::Auto;
+    return std::nullopt;
+}
 void applyLatencyProfile(LatencyProfile profile, AppConfig& config) {
     config.latencyProfile = profile;
     switch(profile) {
@@ -106,6 +112,8 @@ ParseResult parseCommandLine(const std::vector<std::string>& args, bool defaultV
         auto requireValue=[&](std::string_view)->const std::string*{if(index+1>=args.size())return nullptr;++index;return &args[index];};
         if(argument=="--help"||argument=="-h")return{ParseAction::Help,std::nullopt,{}};
         if(argument=="--version")return{ParseAction::Version,std::nullopt,{}};
+        if(argument=="--list-decoders")return{ParseAction::ListDecoders,std::nullopt,{}};
+        if(argument=="--decoder-capabilities")return{ParseAction::DecoderCapabilities,std::nullopt,{}};
         if(argument=="--loop"){config.loop=true;continue;} if(argument=="--fullscreen"){config.fullscreen=true;continue;}
         if(argument=="--borderless"){config.borderless=true;continue;} if(argument=="--drop-late-frames"){config.dropLateFrames=true;continue;}
         if(argument=="--source") { const auto* value=requireValue(argument);const auto parsed=value?parseSourceKind(*value):std::nullopt;if(!parsed)return{ParseAction::Run,std::nullopt,"--source requires file, sysdvr-pipe, or sysdvr"};config.source=*parsed; }
@@ -117,6 +125,7 @@ ParseResult parseCommandLine(const std::vector<std::string>& args, bool defaultV
         else if(argument=="--upscaler-pipe-queue-messages") { const auto* value=requireValue(argument);int parsed{};if(!value||!parseIntInRange(*value,parsed,1,1024))return{ParseAction::Run,std::nullopt,"--upscaler-pipe-queue-messages requires an integer in [1, 1024]"};config.bridgePipeQueueMessages=parsed; }
         else if(argument=="--upscaler-pipe-queue-bytes") { const auto* value=requireValue(argument);int parsed{};if(!value||!parseIntInRange(*value,parsed,64*1024,64*1024*1024))return{ParseAction::Run,std::nullopt,"--upscaler-pipe-queue-bytes requires an integer in [65536, 67108864]"};config.bridgePipeQueueBytes=parsed; }
         else if(argument=="--upscaler-pipe-max-age-ms") { const auto* value=requireValue(argument);int parsed{};if(!value||!parseIntInRange(*value,parsed,1,1000))return{ParseAction::Run,std::nullopt,"--upscaler-pipe-max-age-ms requires an integer in [1, 1000]"};config.bridgePipeMaxAgeMs=parsed; }
+        else if(argument=="--decoder"||argument=="--decoder-backend") { const auto* value=requireValue(argument);const auto parsed=value?parseDecoderBackend(*value):std::nullopt;if(!parsed)return{ParseAction::Run,std::nullopt,"--decoder requires software, d3d11va, or auto"};config.decoderBackend=*parsed; }
         else if(argument=="--quality-preset") { const auto* value=requireValue(argument); if(!value||!applyQualityPreset(*value,config))return{ParseAction::Run,std::nullopt,"--quality-preset requires balanced, performance, or quality"}; }
         else if(argument=="--width"||argument=="--height") { const auto* value=requireValue(argument);int parsed{};if(!value||!parsePositiveInt(*value,parsed))return{ParseAction::Run,std::nullopt,argument+" requires an integer in [1, 16384]"};(argument=="--width"?config.outputWidth:config.outputHeight)=parsed; }
         else if(argument=="--monitor") { const auto* value=requireValue(argument);int parsed{};if(!value||!parseNonNegativeInt(*value,parsed))return{ParseAction::Run,std::nullopt,"--monitor requires a non-negative integer monitor index"};config.monitorIndex=parsed; }
@@ -157,6 +166,11 @@ Input options:
   --upscaler-pipe-queue-messages <n> Managed bridge queue message cap
   --upscaler-pipe-queue-bytes <n> Managed bridge queue byte cap
   --upscaler-pipe-max-age-ms <n> Managed bridge oldest-payload age cap
+  --decoder <backend>       software|d3d11va|auto (default software)
+
+Diagnostics:
+  --list-decoders           List software and FFmpeg hardware decoder inventory
+  --decoder-capabilities    Report Phase 3 hardware decode and interop capabilities
 
 Output and quality:
   --width/--height <pixels>   Reconstruction output/client framebuffer request (default 1920x1080)

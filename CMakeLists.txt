@@ -39,6 +39,7 @@ if(NS60_BUILD_APP)
     src/main.cpp
     src/app/Application.cpp
     src/decode/FFmpegRuntime.cpp
+    src/decode/DecoderCapabilities.cpp
     src/decode/FFmpegVideoReader.cpp
     src/decode/SysDvrPipeSource.cpp
     src/platform/Window.cpp
@@ -54,6 +55,9 @@ if(NS60_BUILD_APP)
     NS60_VERSION="${PROJECT_VERSION}"
     NS60_DEFAULT_VALIDATION=$<IF:$<BOOL:${NS60_ENABLE_VALIDATION}>,1,0>
     NOMINMAX WIN32_LEAN_AND_MEAN)
+  if(WIN32)
+    target_link_libraries(NexusStream60 PRIVATE d3d11 dxgi)
+  endif()
   ns60_enable_warnings(NexusStream60)
   include(CompileShaders)
   ns60_compile_shaders(NexusStream60

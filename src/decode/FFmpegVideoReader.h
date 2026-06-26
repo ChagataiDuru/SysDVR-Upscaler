@@ -1,6 +1,7 @@
 #pragma once
 
 #include "decode/DecodedFrame.h"
+#include "decode/DecoderBackend.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -16,6 +17,8 @@ struct SysDvrPipeInput {
 struct VideoStreamInfo {
     std::string codecName;
     std::string pixelFormatName;
+    DecoderBackend requestedDecoderBackend{DecoderBackend::Software};
+    DecoderBackend activeDecoderBackend{DecoderBackend::Software};
     int width{};
     int height{};
     double declaredFrameRate{};
@@ -37,8 +40,8 @@ enum class ReadFrameResult { Frame, EndOfFile };
 
 class FFmpegVideoReader final {
 public:
-    explicit FFmpegVideoReader(const std::filesystem::path& path);
-    explicit FFmpegVideoReader(SysDvrPipeInput input);
+    explicit FFmpegVideoReader(const std::filesystem::path& path, DecoderBackend backend = DecoderBackend::Software);
+    explicit FFmpegVideoReader(SysDvrPipeInput input, DecoderBackend backend = DecoderBackend::Software);
     ~FFmpegVideoReader();
     FFmpegVideoReader(const FFmpegVideoReader&) = delete;
     FFmpegVideoReader& operator=(const FFmpegVideoReader&) = delete;

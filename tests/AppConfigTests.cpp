@@ -112,3 +112,21 @@ TEST_CASE("CLI rejects invalid live latency values") {
     CHECK_FALSE(ns60::parseCommandLine({"app", "--source", "sysdvr-pipe", "--live-frame-queue-depth", "4"}, false).config);
     CHECK_FALSE(ns60::parseCommandLine({"app", "--source", "sysdvr-pipe", "--upscaler-pipe-max-age-ms", "0"}, false).config);
 }
+TEST_CASE("CLI handles decoder diagnostics without an input") {
+    const auto list = ns60::parseCommandLine({"app", "--list-decoders"}, false);
+    CHECK(list.action == ns60::ParseAction::ListDecoders);
+    CHECK_FALSE(list.config);
+    CHECK(list.error.empty());
+
+    const auto capabilities = ns60::parseCommandLine({"app", "--decoder-capabilities"}, false);
+    CHECK(capabilities.action == ns60::ParseAction::DecoderCapabilities);
+    CHECK_FALSE(capabilities.config);
+    CHECK(capabilities.error.empty());
+}
+TEST_CASE("CLI parses decoder backend selection") {
+    const auto result = ns60::parseCommandLine({"app", "--source", "sysdvr-pipe", "--decoder", "d3d11va"}, false);
+    REQUIRE(result.config);
+    CHECK(static_cast<int>(result.config->decoderBackend) == static_cast<int>(ns60::DecoderBackend::D3D11VA));
+
+    CHECK_FALSE(ns60::parseCommandLine({"app", "--input", "x.mp4", "--decoder", "cuda"}, false).config);
+}

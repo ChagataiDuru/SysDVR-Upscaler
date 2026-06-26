@@ -1,5 +1,6 @@
 #include "app/AppConfig.h"
 #include "app/ApplicationEntry.h"
+#include "decode/DecoderCapabilities.h"
 #include "utility/Log.h"
 
 #include <iostream>
@@ -23,6 +24,8 @@ int run(const std::vector<std::string>& arguments) {
         const auto parsed = ns60::parseCommandLine(arguments, NS60_DEFAULT_VALIDATION != 0);
         if (parsed.action == ns60::ParseAction::Help) { std::cout << ns60::commandLineHelp(); return 0; }
         if (parsed.action == ns60::ParseAction::Version) { std::cout << "NexusStream60 " NS60_VERSION "\n"; return 0; }
+        if (parsed.action == ns60::ParseAction::ListDecoders) { std::cout << ns60::decoderListReport(); return 0; }
+        if (parsed.action == ns60::ParseAction::DecoderCapabilities) { std::cout << ns60::decoderCapabilitiesReport(); return 0; }
         if (!parsed.config) {
             std::cerr << "Error: " << parsed.error << "\n\n" << ns60::commandLineHelp();
             return 2;

@@ -235,6 +235,7 @@ int runApplication(AppConfig config) {
     const auto playbackPolicy = playbackPolicyFor(config.source);
     Log::info("Source: " + std::string(toString(config.source)));
     Log::info("Playback policy: " + std::string(toString(playbackPolicy)));
+    Log::info("Decoder backend request: " + std::string(toString(config.decoderBackend)));
     if (playbackPolicy == PlaybackPolicy::ImmediateLive) {
         Log::info(std::format("Latency profile: {}, live decoded queue depth {}, bridge queue {} messages / {} bytes / {} ms",
             toString(config.latencyProfile), config.liveFrameQueueDepth, config.bridgePipeQueueMessages,
@@ -246,8 +247,8 @@ int runApplication(AppConfig config) {
     Log::info(std::format("FFmpeg libraries: avformat {}, avcodec {}, avutil {}", versions.avformat, versions.avcodec, versions.avutil));
 
     FFmpegVideoReader reader = config.source == SourceKind::File
-        ? FFmpegVideoReader(config.input)
-        : FFmpegVideoReader(SysDvrPipeInput{config.pipeName});
+        ? FFmpegVideoReader(config.input, config.decoderBackend)
+        : FFmpegVideoReader(SysDvrPipeInput{config.pipeName}, config.decoderBackend);
     const auto info = reader.info();
     if (info.live) {
         Log::info(std::format("Input: {} {}x{} {}, live SysDVR timing, rate N/A, duration N/A, {} / {}, chroma {}",
@@ -258,6 +259,7 @@ int runApplication(AppConfig config) {
             info.codecName, info.width, info.height, info.pixelFormatName, info.declaredFrameRate, info.averageFrameRate,
             info.durationSeconds, toString(info.color.range), toString(info.color.matrix), info.chromaLocation));
     }
+    Log::info(std::format("Active decoder backend: {}", toString(info.activeDecoderBackend)));
     Log::info(std::format("Output: {}x{}, {}", config.outputWidth, config.outputHeight, displayName(config.upscale)));
 
     const bool liveMode = playbackPolicy == PlaybackPolicy::ImmediateLive;
