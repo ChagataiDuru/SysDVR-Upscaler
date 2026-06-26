@@ -24,6 +24,7 @@
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -175,8 +176,8 @@ private:
     }
 };
 
-BridgeProcess launchSysDvrBridge(const std::filesystem::path& bridgePath, const std::string& pipeName) {
-    const auto executable = std::filesystem::absolute(bridgePath);
+BridgeProcess launchSysDvrBridge(const AppConfig& config) {
+    const auto executable = std::filesystem::absolute(config.sysdvrBridge);
     if (!std::filesystem::exists(executable)) {
         throw std::runtime_error("SysDVR bridge executable does not exist: " + executable.string());
     }
@@ -185,8 +186,14 @@ BridgeProcess launchSysDvrBridge(const std::filesystem::path& bridgePath, const 
         executable.wstring(),
         L"usb",
         L"--upscaler-video-pipe",
-        widenUtf8(pipeName),
-        L"--no-audio"
+        widenUtf8(config.pipeName),
+        L"--no-audio",
+        L"--upscaler-pipe-queue-messages",
+        std::to_wstring(config.bridgePipeQueueMessages),
+        L"--upscaler-pipe-queue-bytes",
+        std::to_wstring(config.bridgePipeQueueBytes),
+        L"--upscaler-pipe-max-age-ms",
+        std::to_wstring(config.bridgePipeMaxAgeMs)
     };
     auto commandLine = commandLineFor(arguments);
     auto workingDirectory = executable.parent_path().wstring();
@@ -200,13 +207,13 @@ BridgeProcess launchSysDvrBridge(const std::filesystem::path& bridgePath, const 
         throw std::runtime_error(std::format("Failed to launch SysDVR bridge: Win32 error {}", static_cast<unsigned long>(GetLastError())));
     }
 
-    Log::info("Launched SysDVR bridge with pipe " + pipeName);
+    Log::info("Launched SysDVR bridge with pipe " + config.pipeName);
     return BridgeProcess(process);
 }
 #else
 std::string makeUniquePipeName() { return {}; }
 class BridgeProcess final {};
-BridgeProcess launchSysDvrBridge(const std::filesystem::path&, const std::string&) {
+BridgeProcess launchSysDvrBridge(const AppConfig&) {
     throw std::runtime_error("Unified SysDVR launch is only available on Windows");
 }
 #endif
@@ -216,7 +223,7 @@ int runApplication(AppConfig config) {
     std::optional<BridgeProcess> bridgeProcess;
     if (config.source == SourceKind::SysDvr) {
         config.pipeName = makeUniquePipeName();
-        bridgeProcess.emplace(launchSysDvrBridge(config.sysdvrBridge, config.pipeName));
+        bridgeProcess.emplace(launchSysDvrBridge(config));
     }
     if (config.source == SourceKind::File && !std::filesystem::exists(config.input)) throw std::runtime_error("Input file does not exist: " + config.input.string());
     Log::info("NexusStream60 " NS60_VERSION);
@@ -225,7 +232,14 @@ int runApplication(AppConfig config) {
 #else
     Log::info("Build configuration: Debug");
 #endif
+    const auto playbackPolicy = playbackPolicyFor(config.source);
     Log::info("Source: " + std::string(toString(config.source)));
+    Log::info("Playback policy: " + std::string(toString(playbackPolicy)));
+    if (playbackPolicy == PlaybackPolicy::ImmediateLive) {
+        Log::info(std::format("Latency profile: {}, live decoded queue depth {}, bridge queue {} messages / {} bytes / {} ms",
+            toString(config.latencyProfile), config.liveFrameQueueDepth, config.bridgePipeQueueMessages,
+            config.bridgePipeQueueBytes, config.bridgePipeMaxAgeMs));
+    }
     if (config.source == SourceKind::File) Log::info("Input path: " + std::filesystem::absolute(config.input).string());
     else Log::info("Input pipe: " + config.pipeName);
     const auto versions = ffmpegVersions();
@@ -235,13 +249,19 @@ int runApplication(AppConfig config) {
         ? FFmpegVideoReader(config.input)
         : FFmpegVideoReader(SysDvrPipeInput{config.pipeName});
     const auto info = reader.info();
-    Log::info(std::format("Input: {} {}x{} {}, {:.3f}/{:.3f} fps, {:.3f} s, {} / {}, chroma {}",
-        info.codecName, info.width, info.height, info.pixelFormatName, info.declaredFrameRate, info.averageFrameRate,
-        info.durationSeconds, toString(info.color.range), toString(info.color.matrix), info.chromaLocation));
+    if (info.live) {
+        Log::info(std::format("Input: {} {}x{} {}, live SysDVR timing, rate N/A, duration N/A, {} / {}, chroma {}",
+            info.codecName, info.width, info.height, info.pixelFormatName,
+            toString(info.color.range), toString(info.color.matrix), info.chromaLocation));
+    } else {
+        Log::info(std::format("Input: {} {}x{} {}, {:.3f}/{:.3f} fps, {:.3f} s, {} / {}, chroma {}",
+            info.codecName, info.width, info.height, info.pixelFormatName, info.declaredFrameRate, info.averageFrameRate,
+            info.durationSeconds, toString(info.color.range), toString(info.color.matrix), info.chromaLocation));
+    }
     Log::info(std::format("Output: {}x{}, {}", config.outputWidth, config.outputHeight, displayName(config.upscale)));
 
-    const bool liveMode = config.source != SourceKind::File;
-    const std::size_t decodeSlots = liveMode ? 3u : FramePool::defaultSlotCount;
+    const bool liveMode = playbackPolicy == PlaybackPolicy::ImmediateLive;
+    const std::size_t decodeSlots = liveMode ? static_cast<std::size_t>(std::max(2, config.liveFrameQueueDepth + 1)) : FramePool::defaultSlotCount;
     FramePool pool(decodeSlots, info.width, info.height);
     FrameQueue queue(pool);
     FramePool displayPool(1, info.width, info.height);
@@ -250,7 +270,7 @@ int runApplication(AppConfig config) {
     VulkanContext context(window, config.validation, config.vsync);
     VideoPipeline pipeline(context, info.width, info.height, config.outputWidth, config.outputHeight, config.upscale, config.sharpen, config.antiRinging, config.presentation, config.presentationExplicit, config.finalFilter, config.chromaUpscale);
     if (config.comparisonA && config.comparisonB) pipeline.setComparison(true, *config.comparisonA, *config.comparisonB);
-    ImGuiOverlay overlay(window, context, overlayInputPath(config), info, config.outputWidth, config.outputHeight);
+    ImGuiOverlay overlay(window, context, overlayInputPath(config), info, config.outputWidth, config.outputHeight, playbackPolicy, config.latencyProfile, config.liveFrameQueueDepth);
 
     std::atomic<bool> seekRequested{};
     std::atomic<bool> decodeEof{};
@@ -327,18 +347,26 @@ int runApplication(AppConfig config) {
             const auto events = window.consumeEvents();
             if (events.togglePause) {
                 paused = !paused;
-                if (paused) playbackClock.pause(); else { playbackClock.resume(); lastActivePresent.reset(); frameStarted = Clock::now(); }
+                if (!liveMode) {
+                    if (paused) playbackClock.pause(); else playbackClock.resume();
+                }
+                if (!paused) { lastActivePresent.reset(); frameStarted = Clock::now(); }
             }
             if (events.stepFrame && paused && !zoomInspector) step = true;
             if (events.seekBeginning) {
-                seekRequested.store(true, std::memory_order_release);
-                playbackClock.reset();
                 current.reset();
                 havePreviousPts = false;
                 lastActivePresent.reset();
                 metrics.resetActivePlayback();
-                seeking = true;
-                step = paused;
+                if (liveMode) {
+                    seeking = false;
+                    step = false;
+                } else {
+                    seekRequested.store(true, std::memory_order_release);
+                    playbackClock.reset();
+                    seeking = true;
+                    step = paused;
+                }
             }
             if (events.toggleFullscreen) window.toggleFullscreen();
             if (events.toggleTelemetry) overlay.setVisible(!overlay.visible());
@@ -356,7 +384,7 @@ int runApplication(AppConfig config) {
             if (events.toggleZoom) {
                 zoomInspector = !zoomInspector;
                 pipeline.setZoomInspector(zoomInspector);
-                if (zoomInspector && !paused) { paused = true; playbackClock.pause(); }
+                if (zoomInspector && !paused) { paused = true; if (!liveMode) playbackClock.pause(); }
             }
             if (zoomInspector) {
                 if (events.zoomDelta != 0.0F) pipeline.setZoom(pipeline.zoom() + events.zoomDelta);
@@ -380,8 +408,23 @@ int runApplication(AppConfig config) {
             if (window.shouldClose()) break;
 
             bool acquiredNewFrame = false;
-            if (!paused || step || seeking) {
-                const auto slot = queue.acquireRead();
+            if (liveMode) {
+                if (!paused || step || seeking) {
+                    const auto slot = queue.tryAcquireNewest();
+                    if (slot) {
+                        const auto& candidate = pool.at(*slot);
+                        copyOwnedFrame(displayed, candidate);
+                        queue.releaseRead(*slot);
+                        current = displayed.metadata;
+                        acquiredNewFrame = true;
+                    } else if (!current && decodeEof.load(std::memory_order_acquire)) {
+                        window.requestClose();
+                    }
+                    seeking = false;
+                    step = false;
+                }
+            } else if (!paused || step || seeking) {
+                const auto slot = queue.acquireReadPreserveOrder();
                 if (!slot) {
                     if (decodeEof.load(std::memory_order_acquire)) window.requestClose();
                     continue;
@@ -428,7 +471,11 @@ int runApplication(AppConfig config) {
                 window.waitEvents(1.0 / 30.0);
             }
 
-            if (!current) continue;
+            if (liveMode && current && !acquiredNewFrame) ++metrics.repeatedFrames;
+            if (!current) {
+                if (liveMode) window.waitEvents(1.0 / 120.0);
+                continue;
+            }
             int framebufferWidth{}, framebufferHeight{};
             if (!window.framebufferExtent(framebufferWidth, framebufferHeight)) {
                 window.waitEvents(0.1);

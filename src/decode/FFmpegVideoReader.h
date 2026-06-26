@@ -22,6 +22,7 @@ struct VideoStreamInfo {
     double averageFrameRate{};
     double durationSeconds{};
     std::int64_t bitRate{};
+    bool live{};
     ColorDescription color{};
     std::string transfer;
     std::string chromaLocation;

@@ -71,7 +71,7 @@ void FrameQueue::cancelWrite(std::size_t slot) {
     writable_.notify_one();
 }
 
-std::optional<std::size_t> FrameQueue::acquireRead() {
+std::optional<std::size_t> FrameQueue::acquireReadPreserveOrder() {
     std::unique_lock lock(mutex_);
     readable_.wait(lock, [this] { return stopped_ || readyCount_ != 0; });
     if (readyCount_ == 0) return std::nullopt;
@@ -81,6 +81,32 @@ std::optional<std::size_t> FrameQueue::acquireRead() {
     if (states_[slot] != SlotState::Ready) throw std::logic_error("FrameQueue state corruption");
     states_[slot] = SlotState::Reading;
     return slot;
+}
+
+std::optional<std::size_t> FrameQueue::acquireRead() {
+    return acquireReadPreserveOrder();
+}
+
+std::optional<std::size_t> FrameQueue::tryAcquireNewest() {
+    std::lock_guard lock(mutex_);
+    if (readyCount_ == 0) return std::nullopt;
+
+    std::optional<std::size_t> newest;
+    while (readyCount_ != 0) {
+        const auto slot = readyRing_[readPos_];
+        readPos_ = (readPos_ + 1) % readyRing_.size();
+        --readyCount_;
+        if (states_[slot] != SlotState::Ready) throw std::logic_error("FrameQueue state corruption while acquiring newest frame");
+        if (newest) {
+            states_[*newest] = SlotState::Free;
+            ++staleDrops_;
+        }
+        newest = slot;
+    }
+
+    states_[*newest] = SlotState::Reading;
+    writable_.notify_all();
+    return newest;
 }
 
 void FrameQueue::releaseRead(std::size_t slot) {

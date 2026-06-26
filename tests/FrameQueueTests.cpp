@@ -117,3 +117,77 @@ TEST_CASE("FrameQueue latest policy drops oldest unpublished frame when full") {
     CHECK(pool.at(*read).metadata.frameNumber == 3);
     queue.releaseRead(*read);
 }
+
+
+TEST_CASE("FrameQueue live consumer acquires newest and releases older ready slots") {
+    ns60::FramePool pool(3, 16, 16);
+    ns60::FrameQueue queue(pool);
+
+    for (std::uint64_t frame = 1; frame <= 3; ++frame) {
+        auto write = queue.acquireWrite();
+        REQUIRE(write);
+        pool.at(*write).metadata.frameNumber = frame;
+        queue.commitWrite(*write);
+    }
+
+    auto newest = queue.tryAcquireNewest();
+    REQUIRE(newest);
+    CHECK(pool.at(*newest).metadata.frameNumber == 3);
+    CHECK(queue.occupancy() == 0);
+    CHECK(queue.staleDropCount() == 2);
+    queue.releaseRead(*newest);
+
+    for (std::uint64_t frame = 4; frame <= 6; ++frame) {
+        auto write = queue.acquireWrite();
+        REQUIRE(write);
+        pool.at(*write).metadata.frameNumber = frame;
+        queue.commitWrite(*write);
+    }
+
+    newest = queue.tryAcquireNewest();
+    REQUIRE(newest);
+    CHECK(pool.at(*newest).metadata.frameNumber == 6);
+    CHECK(queue.occupancy() == 0);
+    CHECK(queue.staleDropCount() == 4);
+    queue.releaseRead(*newest);
+}
+
+TEST_CASE("FrameQueue live newest read is non-blocking when empty") {
+    ns60::FramePool pool(2, 16, 16);
+    ns60::FrameQueue queue(pool);
+    CHECK_FALSE(queue.tryAcquireNewest().has_value());
+
+    auto write = queue.acquireWriteLatest();
+    REQUIRE(write);
+    pool.at(*write).metadata.frameNumber = 10;
+    queue.commitWrite(*write);
+
+    auto newest = queue.tryAcquireNewest();
+    REQUIRE(newest);
+    CHECK(pool.at(*newest).metadata.frameNumber == 10);
+    queue.releaseRead(*newest);
+    CHECK_FALSE(queue.tryAcquireNewest().has_value());
+}
+
+
+TEST_CASE("FrameQueue latest policy supports depth one replacement") {
+    ns60::FramePool pool(1, 16, 16);
+    ns60::FrameQueue queue(pool);
+
+    auto first = queue.acquireWriteLatest();
+    REQUIRE(first);
+    pool.at(*first).metadata.frameNumber = 1;
+    queue.commitWrite(*first);
+
+    auto second = queue.acquireWriteLatest();
+    REQUIRE(second);
+    CHECK(*second == *first);
+    pool.at(*second).metadata.frameNumber = 2;
+    queue.commitWrite(*second);
+
+    CHECK(queue.staleDropCount() == 1);
+    auto read = queue.tryAcquireNewest();
+    REQUIRE(read);
+    CHECK(pool.at(*read).metadata.frameNumber == 2);
+    queue.releaseRead(*read);
+}

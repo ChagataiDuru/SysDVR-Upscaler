@@ -12,12 +12,19 @@ namespace ns60 {
 
 enum class LogLevel { Trace, Debug, Info, Warning, Error, Critical };
 enum class SourceKind { File, SysDvrPipe, SysDvr };
+enum class PlaybackPolicy { TimedFile, ImmediateLive };
+enum class LatencyProfile { Quality, Balanced, Ultra };
 
 struct AppConfig {
     SourceKind source{SourceKind::File};
+    LatencyProfile latencyProfile{LatencyProfile::Balanced};
     std::filesystem::path input;
     std::string pipeName{"SysDVR-Upscaler.Video"};
     std::filesystem::path sysdvrBridge;
+    int liveFrameQueueDepth{1};
+    int bridgePipeQueueMessages{16};
+    int bridgePipeQueueBytes{1024 * 1024};
+    int bridgePipeMaxAgeMs{50};
     int outputWidth{1920};
     int outputHeight{1080};
     UpscaleMode upscale{UpscaleMode::Bilinear};
@@ -50,5 +57,8 @@ struct ParseResult {
 [[nodiscard]] std::string commandLineHelp();
 [[nodiscard]] const char* toString(LogLevel level) noexcept;
 [[nodiscard]] std::string_view toString(SourceKind source) noexcept;
+[[nodiscard]] std::string_view toString(PlaybackPolicy policy) noexcept;
+[[nodiscard]] std::string_view toString(LatencyProfile profile) noexcept;
+[[nodiscard]] PlaybackPolicy playbackPolicyFor(SourceKind source) noexcept;
 
 } // namespace ns60

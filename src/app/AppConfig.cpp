@@ -11,6 +11,11 @@ bool parsePositiveInt(std::string_view text, int& value) {
     if(error!=std::errc{}||end!=text.data()+text.size()||parsed<=0||parsed>16384) return false; value=parsed; return true;
 }
 
+bool parseIntInRange(std::string_view text, int& value, int minimum, int maximum) {
+    int parsed{}; const auto [end,error]=std::from_chars(text.data(),text.data()+text.size(),parsed);
+    if(error!=std::errc{}||end!=text.data()+text.size()||parsed<minimum||parsed>maximum) return false; value=parsed; return true;
+}
+
 bool parseNonNegativeInt(std::string_view text, int& value) {
     int parsed{}; const auto [end,error]=std::from_chars(text.data(),text.data()+text.size(),parsed);
     if(error!=std::errc{}||end!=text.data()+text.size()||parsed<0||parsed>256) return false; value=parsed; return true;
@@ -31,6 +36,35 @@ std::optional<SourceKind> parseSourceKind(std::string_view text) {
     if(text=="sysdvr-pipe") return SourceKind::SysDvrPipe;
     if(text=="sysdvr") return SourceKind::SysDvr;
     return std::nullopt;
+}
+std::optional<LatencyProfile> parseLatencyProfile(std::string_view text) {
+    if(text=="quality") return LatencyProfile::Quality;
+    if(text=="balanced") return LatencyProfile::Balanced;
+    if(text=="ultra") return LatencyProfile::Ultra;
+    return std::nullopt;
+}
+void applyLatencyProfile(LatencyProfile profile, AppConfig& config) {
+    config.latencyProfile = profile;
+    switch(profile) {
+    case LatencyProfile::Quality:
+        config.liveFrameQueueDepth = 2;
+        config.bridgePipeQueueMessages = 32;
+        config.bridgePipeQueueBytes = 2 * 1024 * 1024;
+        config.bridgePipeMaxAgeMs = 100;
+        break;
+    case LatencyProfile::Balanced:
+        config.liveFrameQueueDepth = 1;
+        config.bridgePipeQueueMessages = 16;
+        config.bridgePipeQueueBytes = 1024 * 1024;
+        config.bridgePipeMaxAgeMs = 50;
+        break;
+    case LatencyProfile::Ultra:
+        config.liveFrameQueueDepth = 1;
+        config.bridgePipeQueueMessages = 8;
+        config.bridgePipeQueueBytes = 1024 * 1024;
+        config.bridgePipeMaxAgeMs = 33;
+        break;
+    }
 }
 std::filesystem::path utf8Path(std::string_view text) { const auto* first=reinterpret_cast<const char8_t*>(text.data()); return std::filesystem::path(std::u8string(first,first+text.size())); }
 
@@ -66,7 +100,7 @@ bool applyQualityPreset(std::string_view text, AppConfig& config) {
 }
 
 ParseResult parseCommandLine(const std::vector<std::string>& args, bool defaultValidation) {
-    AppConfig config; config.validation=defaultValidation; bool inputSeen=false;
+    AppConfig config; config.validation=defaultValidation; applyLatencyProfile(config.latencyProfile, config); bool inputSeen=false;
     for(std::size_t index=1;index<args.size();++index) {
         const auto& argument=args[index];
         auto requireValue=[&](std::string_view)->const std::string*{if(index+1>=args.size())return nullptr;++index;return &args[index];};
@@ -78,6 +112,11 @@ ParseResult parseCommandLine(const std::vector<std::string>& args, bool defaultV
         else if(argument=="--input") { const auto* value=requireValue(argument); if(!value||value->empty())return{ParseAction::Run,std::nullopt,"--input requires a path"}; config.input=utf8Path(*value);inputSeen=true; }
         else if(argument=="--pipe-name") { const auto* value=requireValue(argument); if(!value||value->empty())return{ParseAction::Run,std::nullopt,"--pipe-name requires a non-empty pipe name"}; config.pipeName=*value; }
         else if(argument=="--sysdvr-bridge") { const auto* value=requireValue(argument); if(!value||value->empty())return{ParseAction::Run,std::nullopt,"--sysdvr-bridge requires a path"}; config.sysdvrBridge=utf8Path(*value); }
+        else if(argument=="--latency-profile") { const auto* value=requireValue(argument);const auto parsed=value?parseLatencyProfile(*value):std::nullopt;if(!parsed)return{ParseAction::Run,std::nullopt,"--latency-profile requires quality, balanced, or ultra"};applyLatencyProfile(*parsed, config); }
+        else if(argument=="--live-frame-queue-depth") { const auto* value=requireValue(argument);int parsed{};if(!value||!parseIntInRange(*value,parsed,1,3))return{ParseAction::Run,std::nullopt,"--live-frame-queue-depth requires an integer in [1, 3]"};config.liveFrameQueueDepth=parsed; }
+        else if(argument=="--upscaler-pipe-queue-messages") { const auto* value=requireValue(argument);int parsed{};if(!value||!parseIntInRange(*value,parsed,1,1024))return{ParseAction::Run,std::nullopt,"--upscaler-pipe-queue-messages requires an integer in [1, 1024]"};config.bridgePipeQueueMessages=parsed; }
+        else if(argument=="--upscaler-pipe-queue-bytes") { const auto* value=requireValue(argument);int parsed{};if(!value||!parseIntInRange(*value,parsed,64*1024,64*1024*1024))return{ParseAction::Run,std::nullopt,"--upscaler-pipe-queue-bytes requires an integer in [65536, 67108864]"};config.bridgePipeQueueBytes=parsed; }
+        else if(argument=="--upscaler-pipe-max-age-ms") { const auto* value=requireValue(argument);int parsed{};if(!value||!parseIntInRange(*value,parsed,1,1000))return{ParseAction::Run,std::nullopt,"--upscaler-pipe-max-age-ms requires an integer in [1, 1000]"};config.bridgePipeMaxAgeMs=parsed; }
         else if(argument=="--quality-preset") { const auto* value=requireValue(argument); if(!value||!applyQualityPreset(*value,config))return{ParseAction::Run,std::nullopt,"--quality-preset requires balanced, performance, or quality"}; }
         else if(argument=="--width"||argument=="--height") { const auto* value=requireValue(argument);int parsed{};if(!value||!parsePositiveInt(*value,parsed))return{ParseAction::Run,std::nullopt,argument+" requires an integer in [1, 16384]"};(argument=="--width"?config.outputWidth:config.outputHeight)=parsed; }
         else if(argument=="--monitor") { const auto* value=requireValue(argument);int parsed{};if(!value||!parseNonNegativeInt(*value,parsed))return{ParseAction::Run,std::nullopt,"--monitor requires a non-negative integer monitor index"};config.monitorIndex=parsed; }
@@ -113,6 +152,11 @@ Input options:
   --input <path>              Input MP4 for file mode (a positional path is also accepted)
   --pipe-name <name>          Named pipe for sysdvr-pipe mode (default SysDVR-Upscaler.Video)
   --sysdvr-bridge <path>      SysDVR-Client executable for unified sysdvr mode
+  --latency-profile <profile> quality|balanced|ultra live buffering preset (default balanced)
+  --live-frame-queue-depth <n> Live decoded queue depth in [1,3] (default 1)
+  --upscaler-pipe-queue-messages <n> Managed bridge queue message cap
+  --upscaler-pipe-queue-bytes <n> Managed bridge queue byte cap
+  --upscaler-pipe-max-age-ms <n> Managed bridge oldest-payload age cap
 
 Output and quality:
   --width/--height <pixels>   Reconstruction output/client framebuffer request (default 1920x1080)
@@ -132,4 +176,7 @@ Output and quality:
 )"; }
 const char* toString(LogLevel level) noexcept { switch(level){case LogLevel::Trace:return"TRACE";case LogLevel::Debug:return"DEBUG";case LogLevel::Info:return"INFO";case LogLevel::Warning:return"WARNING";case LogLevel::Error:return"ERROR";case LogLevel::Critical:return"CRITICAL";}return"UNKNOWN"; }
 std::string_view toString(SourceKind source) noexcept { switch(source){case SourceKind::File:return"file";case SourceKind::SysDvrPipe:return"sysdvr-pipe";case SourceKind::SysDvr:return"sysdvr";}return"unknown"; }
+std::string_view toString(PlaybackPolicy policy) noexcept { switch(policy){case PlaybackPolicy::TimedFile:return"TimedFile";case PlaybackPolicy::ImmediateLive:return"ImmediateLive";}return"unknown"; }
+std::string_view toString(LatencyProfile profile) noexcept { switch(profile){case LatencyProfile::Quality:return"quality";case LatencyProfile::Balanced:return"balanced";case LatencyProfile::Ultra:return"ultra";}return"unknown"; }
+PlaybackPolicy playbackPolicyFor(SourceKind source) noexcept { return source == SourceKind::File ? PlaybackPolicy::TimedFile : PlaybackPolicy::ImmediateLive; }
 } // namespace ns60

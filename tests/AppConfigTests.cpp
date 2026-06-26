@@ -92,3 +92,23 @@ TEST_CASE("CLI rejects live-only option conflicts") {
     CHECK_FALSE(ns60::parseCommandLine({"app", "--source", "sysdvr-pipe", "--loop"}, false).config);
     CHECK_FALSE(ns60::parseCommandLine({"app", "--source", "sysdvr"}, false).config);
 }
+
+
+TEST_CASE("CLI parses live latency profile and queue overrides") {
+    const auto result = ns60::parseCommandLine({"app", "--source", "sysdvr-pipe", "--latency-profile", "ultra",
+        "--live-frame-queue-depth", "2", "--upscaler-pipe-queue-messages", "12",
+        "--upscaler-pipe-queue-bytes", "1048576", "--upscaler-pipe-max-age-ms", "40"}, false);
+    REQUIRE(result.config);
+    CHECK(static_cast<int>(result.config->latencyProfile) == static_cast<int>(ns60::LatencyProfile::Ultra));
+    CHECK(result.config->liveFrameQueueDepth == 2);
+    CHECK(result.config->bridgePipeQueueMessages == 12);
+    CHECK(result.config->bridgePipeQueueBytes == 1048576);
+    CHECK(result.config->bridgePipeMaxAgeMs == 40);
+    CHECK(static_cast<int>(ns60::playbackPolicyFor(result.config->source)) == static_cast<int>(ns60::PlaybackPolicy::ImmediateLive));
+}
+
+TEST_CASE("CLI rejects invalid live latency values") {
+    CHECK_FALSE(ns60::parseCommandLine({"app", "--source", "sysdvr-pipe", "--latency-profile", "fast"}, false).config);
+    CHECK_FALSE(ns60::parseCommandLine({"app", "--source", "sysdvr-pipe", "--live-frame-queue-depth", "4"}, false).config);
+    CHECK_FALSE(ns60::parseCommandLine({"app", "--source", "sysdvr-pipe", "--upscaler-pipe-max-age-ms", "0"}, false).config);
+}

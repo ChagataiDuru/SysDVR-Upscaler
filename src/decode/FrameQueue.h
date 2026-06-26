@@ -24,7 +24,9 @@ public:
     [[nodiscard]] std::optional<std::size_t> acquireWriteLatest();
     void commitWrite(std::size_t slot);
     void cancelWrite(std::size_t slot);
+    [[nodiscard]] std::optional<std::size_t> acquireReadPreserveOrder();
     [[nodiscard]] std::optional<std::size_t> acquireRead();
+    [[nodiscard]] std::optional<std::size_t> tryAcquireNewest();
     void releaseRead(std::size_t slot);
     void stop() noexcept;
     [[nodiscard]] bool stopped() const noexcept;

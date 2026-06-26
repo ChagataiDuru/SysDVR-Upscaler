@@ -22,8 +22,10 @@ void metricRow(const char* label, const RollingMetric<>& metric, const char* uni
 } // namespace
 
 ImGuiOverlay::ImGuiOverlay(Window& window, VulkanContext& context, const std::filesystem::path& input,
-                           const VideoStreamInfo& stream, int outputWidth, int outputHeight)
-    : window_(window), context_(context), input_(input), stream_(stream), outputWidth_(outputWidth), outputHeight_(outputHeight) {
+                           const VideoStreamInfo& stream, int outputWidth, int outputHeight,
+                           PlaybackPolicy playbackPolicy, LatencyProfile latencyProfile, int liveFrameQueueDepth)
+    : window_(window), context_(context), input_(input), stream_(stream), outputWidth_(outputWidth), outputHeight_(outputHeight),
+      playbackPolicy_(playbackPolicy), latencyProfile_(latencyProfile), liveFrameQueueDepth_(liveFrameQueueDepth) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
@@ -67,8 +69,16 @@ void ImGuiOverlay::build(const Metrics& metrics, const std::optional<VideoFrameM
             ImGui::Text("Codec / format: %s / %s", stream_.codecName.c_str(), stream_.pixelFormatName.c_str());
             ImGui::Text("Input / output: %dx%d / %dx%d", stream_.width, stream_.height, outputWidth_, outputHeight_);
             ImGui::Text("Color: %s, %s, transfer %s", toString(stream_.color.range), toString(stream_.color.matrix), stream_.transfer.c_str());
-            ImGui::Text("Rate declared / average: %.3f / %.3f fps", stream_.declaredFrameRate, stream_.averageFrameRate);
-            ImGui::Text("State: %s", paused ? "paused" : "playing");
+            if (stream_.live) {
+                ImGui::Text("Source mode: Live SysDVR");
+                ImGui::Text("Scheduling: %s", toString(playbackPolicy_).data());
+                ImGui::Text("Latency profile: %s", toString(latencyProfile_).data());
+                ImGui::Text("Live decoded queue depth: %d", liveFrameQueueDepth_);
+                ImGui::TextUnformatted("Rate declared / average: N/A / N/A");
+            } else {
+                ImGui::Text("Rate declared / average: %.3f / %.3f fps", stream_.declaredFrameRate, stream_.averageFrameRate);
+            }
+            ImGui::Text("State: %s", paused ? "paused" : (stream_.live ? "live" : "playing"));
             ImGui::Text("Upscale: %s", displayName(pipeline.mode()).data());
             int selected = static_cast<int>(pipeline.mode());
             constexpr const char* modeNames[] = {"Nearest","Bilinear","Bicubic Catmull-Rom","Lanczos2","Bilinear + CAS","Lanczos2 + CAS","FSR1 EASU","FSR1 EASU + RCAS"};
@@ -100,9 +110,14 @@ void ImGuiOverlay::build(const Metrics& metrics, const std::optional<VideoFrameM
                 pipeline.zoomCenterX() * outputWidth_ - regionWidth * 0.5F,
                 pipeline.zoomCenterY() * outputHeight_ - regionHeight * 0.5F, regionWidth, regionHeight);
             if (current) {
-                ImGui::Text("PTS / delta / duration: %.6f s / %.3f ms / %.3f ms", current->ptsSeconds,
-                    metrics.ptsDeltaMs.latest(), current->durationSeconds * 1000.0);
-                ImGui::Text("Decoded frame: %llu", static_cast<unsigned long long>(current->frameNumber));
+                if (stream_.live || current->timingKind == FrameTimingKind::LiveArrival) {
+                    ImGui::TextUnformatted("Frame timing: live arrival (container PTS N/A)");
+                    ImGui::Text("Decoded live frame: %llu", static_cast<unsigned long long>(current->frameNumber));
+                } else {
+                    ImGui::Text("PTS / delta / duration: %.6f s / %.3f ms / %.3f ms", current->ptsSeconds,
+                        metrics.ptsDeltaMs.latest(), current->durationSeconds * 1000.0);
+                    ImGui::Text("Decoded frame: %llu", static_cast<unsigned long long>(current->frameNumber));
+                }
             }
             ImGui::Separator();
             ImGui::Text("Instant FPS: %.2f", fpsFromLatestInterval(metrics.presentSubmissionIntervalMs));
@@ -110,12 +125,18 @@ void ImGuiOverlay::build(const Metrics& metrics, const std::optional<VideoFrameM
             ImGui::Text("Lifetime active presented FPS: %.2f", metrics.activePlaybackSeconds > 0.0 ? static_cast<double>(metrics.presentedFrames) / metrics.activePlaybackSeconds : 0.0);
             ImGui::Text("Decoder throughput FPS: %.2f", metrics.decodedFps.latest());
             ImGui::Text("Decoded queue: %zu (high-water %zu)", metrics.queueOccupancy, metrics.queueHighWater);
-            ImGui::Text("Dropped / repeated / late: %llu / %llu / %llu",
-                static_cast<unsigned long long>(metrics.droppedFrames), static_cast<unsigned long long>(metrics.repeatedFrames),
-                static_cast<unsigned long long>(metrics.lateFrames));
-            ImGui::Text("Stale decoded frames dropped: %llu", static_cast<unsigned long long>(metrics.staleDecodedFramesDropped));
-            metricRow("Playback drift", metrics.driftMs);
-            metricRow("Frame lateness", metrics.latenessMs);
+            if (stream_.live) {
+                ImGui::Text("Dropped / repeated: %llu / %llu",
+                    static_cast<unsigned long long>(metrics.droppedFrames), static_cast<unsigned long long>(metrics.repeatedFrames));
+                ImGui::Text("Stale decoded frames dropped: %llu", static_cast<unsigned long long>(metrics.staleDecodedFramesDropped));
+            } else {
+                ImGui::Text("Dropped / repeated / late: %llu / %llu / %llu",
+                    static_cast<unsigned long long>(metrics.droppedFrames), static_cast<unsigned long long>(metrics.repeatedFrames),
+                    static_cast<unsigned long long>(metrics.lateFrames));
+                ImGui::Text("Stale decoded frames dropped: %llu", static_cast<unsigned long long>(metrics.staleDecodedFramesDropped));
+                metricRow("Playback drift", metrics.driftMs);
+                metricRow("Frame lateness", metrics.latenessMs);
+            }
             metricRow("CPU decode", metrics.decodeMs);
             metricRow("CPU plane copy", metrics.planeCopyMs);
             metricRow("CPU decoder wait", metrics.decoderWaitMs);

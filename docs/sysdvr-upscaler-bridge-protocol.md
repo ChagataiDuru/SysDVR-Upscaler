@@ -36,7 +36,7 @@ Unknown capability bits must be ignored.
 
 ## Stream Message
 
-Every message after hello starts with a stream header.
+Every message after hello starts with a stream header. For video payload messages, `Bridge monotonic timestamp` is the bridge `Stopwatch.GetTimestamp()` value captured when the SysDVR `OutStream.SendDataImpl` target receives the payload, before the payload is placed into the pipe-writer queue. This value is intentionally not the named-pipe write time.
 
 | Offset | Size | Field |
 | --- | ---: | --- |
@@ -69,6 +69,36 @@ Flags:
 | 2 | BridgeShuttingDown |
 
 Maximum payload size is 16 MiB. Larger declarations are rejected before allocation.
+
+
+## Status Payload
+
+`Status` messages use protocol version 1 and carry a fixed-size little-endian payload. They are sent approximately once per second while video traffic is active. Readers may ignore the payload or safely ignore bytes beyond the declared structure size.
+
+| Offset | Size | Field |
+| --- | ---: | --- |
+| 0 | 2 | Status payload version, currently `1` |
+| 2 | 2 | Payload structure size, currently `144` |
+| 4 | 4 | Current bridge queue message count |
+| 8 | 8 | Current bridge queued bytes |
+| 16 | 4 | Bridge queue high-water message count |
+| 20 | 8 | Bridge queue high-water bytes |
+| 28 | 8 | Oldest queued payload age, microseconds |
+| 36 | 8 | Total video payloads accepted |
+| 44 | 8 | Total video bytes accepted |
+| 52 | 8 | Total payloads written |
+| 60 | 8 | Total bytes written |
+| 68 | 8 | Total payloads dropped |
+| 76 | 8 | Total bytes dropped |
+| 84 | 8 | Total discontinuities emitted |
+| 92 | 8 | Latest pipe write duration, microseconds |
+| 100 | 8 | Rolling pipe write duration, microseconds |
+| 108 | 8 | Bridge uptime, microseconds |
+| 116 | 8 | Queue overflow events |
+| 124 | 8 | Stale queue reset events |
+| 132 | 12 | Reserved, zero |
+
+The bridge queue is latency-aware. If the oldest queued video payload exceeds the configured max age, the bridge drops all queued video payloads, releases their retained buffers exactly once, counts the drops, emits one `Discontinuity` message before the next video payload, and resumes from fresh incoming data.
 
 ## Validation
 

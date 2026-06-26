@@ -1,5 +1,6 @@
 #pragma once
 
+#include "app/AppConfig.h"
 #include "decode/FFmpegVideoReader.h"
 #include "platform/Window.h"
 #include "render/VideoPipeline.h"
@@ -14,7 +15,8 @@ namespace ns60 {
 class ImGuiOverlay final {
 public:
     ImGuiOverlay(Window& window, VulkanContext& context, const std::filesystem::path& input,
-                 const VideoStreamInfo& stream, int outputWidth, int outputHeight);
+                 const VideoStreamInfo& stream, int outputWidth, int outputHeight,
+                 PlaybackPolicy playbackPolicy, LatencyProfile latencyProfile, int liveFrameQueueDepth);
     ~ImGuiOverlay();
     ImGuiOverlay(const ImGuiOverlay&) = delete;
     ImGuiOverlay& operator=(const ImGuiOverlay&) = delete;
@@ -31,6 +33,9 @@ private:
     VideoStreamInfo stream_;
     int outputWidth_{};
     int outputHeight_{};
+    PlaybackPolicy playbackPolicy_{PlaybackPolicy::TimedFile};
+    LatencyProfile latencyProfile_{LatencyProfile::Balanced};
+    int liveFrameQueueDepth_{};
     bool visible_{true};
 };
 

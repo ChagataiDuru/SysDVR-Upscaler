@@ -8,6 +8,8 @@
 
 namespace ns60 {
 
+enum class FrameTimingKind { ContainerPts, LiveArrival };
+
 struct VideoFrameMetadata {
     int width{};
     int height{};
@@ -16,6 +18,7 @@ struct VideoFrameMetadata {
     double durationSeconds{};
     std::uint64_t frameNumber{};
     bool keyFrame{};
+    FrameTimingKind timingKind{FrameTimingKind::ContainerPts};
     ColorDescription color{};
 };
 

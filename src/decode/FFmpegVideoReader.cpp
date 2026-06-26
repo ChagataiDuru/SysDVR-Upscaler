@@ -82,6 +82,7 @@ struct FFmpegVideoReader::Impl {
     VideoStreamInfo streamInfo;
     bool draining{};
     bool seekable{true};
+    bool liveInput{};
     bool allowMetadataDefaults{};
     std::uint64_t frameNumber{};
     std::int64_t lastPts{AV_NOPTS_VALUE};
@@ -96,6 +97,7 @@ struct FFmpegVideoReader::Impl {
     explicit Impl(SysDvrPipeInput input) {
         if (input.pipeName.empty()) throw std::invalid_argument("SysDVR pipe input requires a pipe name");
         seekable = false;
+        liveInput = true;
         allowMetadataDefaults = true;
         openPipe(std::move(input.pipeName));
     }
@@ -213,6 +215,13 @@ struct FFmpegVideoReader::Impl {
             ? static_cast<double>(stream->duration) * rational(stream->time_base)
             : (format->duration != AV_NOPTS_VALUE ? static_cast<double>(format->duration) / AV_TIME_BASE : 0.0);
         streamInfo.bitRate = stream->codecpar->bit_rate > 0 ? stream->codecpar->bit_rate : format->bit_rate;
+        streamInfo.live = liveInput;
+        if (liveInput) {
+            streamInfo.declaredFrameRate = 0.0;
+            streamInfo.averageFrameRate = 0.0;
+            streamInfo.durationSeconds = 0.0;
+            streamInfo.bitRate = 0;
+        }
         streamInfo.color = {mapRange(range, allowMetadataDefaults), mapMatrix(matrix, allowMetadataDefaults)};
         streamInfo.transfer = av_color_transfer_name(stream->codecpar->color_trc)
             ? av_color_transfer_name(stream->codecpar->color_trc) : "unspecified";
@@ -238,18 +247,24 @@ struct FFmpegVideoReader::Impl {
                 }
                 const auto decodedAt = Clock::now();
                 auto pts = frame->best_effort_timestamp;
-                const double fallbackDuration = streamInfo.averageFrameRate > 0.0 ? 1.0 / streamInfo.averageFrameRate : 1.0 / 60.0;
                 double ptsSeconds{};
-                if (pts == AV_NOPTS_VALUE) {
-                    ptsSeconds = fallbackPts;
-                    Log::warning("Decoded frame has no timestamp; synthesizing from the preceding frame duration");
+                double duration{};
+                auto timingKind = FrameTimingKind::ContainerPts;
+                if (liveInput) {
+                    timingKind = FrameTimingKind::LiveArrival;
                 } else {
-                    ptsSeconds = static_cast<double>(pts) * rational(stream->time_base);
-                    lastPts = pts;
+                    const double fallbackDuration = streamInfo.averageFrameRate > 0.0 ? 1.0 / streamInfo.averageFrameRate : 1.0 / 60.0;
+                    if (pts == AV_NOPTS_VALUE) {
+                        ptsSeconds = fallbackPts;
+                        Log::warning("Decoded frame has no timestamp; synthesizing from the preceding frame duration");
+                    } else {
+                        ptsSeconds = static_cast<double>(pts) * rational(stream->time_base);
+                        lastPts = pts;
+                    }
+                    duration = frame->duration > 0
+                        ? static_cast<double>(frame->duration) * rational(stream->time_base) : fallbackDuration;
+                    fallbackPts = ptsSeconds + duration;
                 }
-                const double duration = frame->duration > 0
-                    ? static_cast<double>(frame->duration) * rational(stream->time_base) : fallbackDuration;
-                fallbackPts = ptsSeconds + duration;
 
                 const auto copyStart = Clock::now();
                 copyPlane(destination.yPlane, destination.yStride, frame->data[0], frame->linesize[0], frame->width, frame->height);
@@ -258,6 +273,7 @@ struct FFmpegVideoReader::Impl {
                 const auto copyEnd = Clock::now();
                 destination.metadata = {frame->width, frame->height, pts, ptsSeconds, duration, frameNumber++,
                     (frame->flags & AV_FRAME_FLAG_KEY) != 0,
+                    timingKind,
                     {mapRange(bestRange(frame->color_range, codec->color_range), allowMetadataDefaults),
                      mapMatrix(bestMatrix(frame->colorspace, codec->colorspace), allowMetadataDefaults)}};
                 timing.decodeMs = std::chrono::duration<double, std::milli>(decodedAt - operationStart).count();
