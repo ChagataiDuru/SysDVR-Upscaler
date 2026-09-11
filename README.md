@@ -1,8 +1,22 @@
 # SysDVR-Upscaler
 
-SysDVR-Upscaler is a Windows-first C++20/Vulkan laboratory for decoding recorded Nintendo Switch SysDVR MP4 video, performing explicit YUV color conversion, and comparing low-latency spatial upscalers. Phase 1 is an offline, timestamp-correct vertical slice: H.264 software decode, owned YUV420P frames, BT.709 conversion, bilinear 720p-to-1080p compute upscale, presentation, telemetry, and screenshots.
+SysDVR-Upscaler is a Windows-first C++20/Vulkan client for low-latency Nintendo Switch SysDVR video. It accepts recorded H.264 captures or a live SysDVR bridge stream, performs explicit YUV color reconstruction, and compares spatial upscalers before presentation.
 
-USB/SysDVR protocol ingestion, live timing reconstruction, audio, hardware decoding, networking, decoder/GPU zero-copy, SPS patching, and advanced/temporal upscalers are deliberately out of scope.
+The current implementation includes software decode, optional FFmpeg D3D11VA decode, direct CPU-NV12 upload into Vulkan, eight upscaling modes, split comparison, timing telemetry, and screenshots. D3D11/Vulkan zero-copy interop is designed and CLI-scaffolded for Phase 3.3, but is not implemented yet.
+
+## Milestone status
+
+| Milestone | Status |
+| --- | --- |
+| Phase 1: offline H.264/Vulkan playback | Implemented and validated with recorded samples |
+| Phase 1.5: presentation, telemetry, chroma, and quality hardening | Implemented |
+| Phase 2: live SysDVR bridge and latest-frame queue | Implemented; Switch hardware validation remains pending |
+| Phase 3.0: decoder and interop capability reporting | Implemented |
+| Phase 3.1: D3D11VA decode with CPU readback | Implemented |
+| Phase 3.2: native CPU-NV12 Vulkan upload | Implemented; manual hardware comparison remains pending |
+| Phase 3.3: D3D11/Vulkan zero-copy NV12 | Planned; inactive scaffold only |
+
+Do not treat the Phase 2 or Phase 3 status as a completed hardware-success claim. USB disconnect/reconnect, visual comparison, and a 30-minute live soak still need to be run on Switch hardware.
 
 ## Windows prerequisites
 
@@ -11,9 +25,9 @@ USB/SysDVR protocol ingestion, live timing reconstruction, audio, hardware decod
 - [LunarG Vulkan SDK](https://vulkan.lunarg.com/) with `VULKAN_SDK` set. Its `glslc` is preferred; `glslangValidator` is accepted.
 - [vcpkg](https://github.com/microsoft/vcpkg) with `VCPKG_ROOT` set. The manifest supplies GLFW, Dear ImGui, FFmpeg development libraries, stb, and doctest.
 
-The FFmpeg command-line download alone is insufficient: compilation needs `libavformat`, `libavcodec`, and `libavutil` headers/import libraries. With no vcpkg toolchain, set `FFMPEG_ROOT` to a conventional `include`/`lib` development tree; CMake prints a precise diagnostic when it cannot find one. See [Windows dependencies](docs/dependencies-windows.md).
+The FFmpeg command-line download alone is insufficient: compilation needs the `libavformat`, `libavcodec`, and `libavutil` headers and import libraries. See [Windows dependencies](docs/dependencies-windows.md).
 
-## Configure and build
+## Configure, build, and test
 
 ```powershell
 git clone https://github.com/microsoft/vcpkg $env:USERPROFILE\src\vcpkg
@@ -25,54 +39,108 @@ cmake --preset win-release
 cmake --build --preset win-release
 ```
 
-Debug uses validation by default; Release does not require validation layers. Core ownership/timing/math tests can be built separately with `cmake --preset core-tests`, `cmake --build --preset core-tests`, and `ctest --preset core-tests`.
+Debug enables Vulkan validation by default. Dependency-light tests use:
 
-## Run
+```powershell
+cmake --preset core-tests
+cmake --build --preset core-tests
+ctest --preset core-tests
+```
+
+Build the managed SysDVR bridge separately when using live input:
+
+```powershell
+.\scripts\build-sysdvr-upscaler-bridge.ps1
+```
+
+## Decoder diagnostics
+
+These commands do not require an input file:
+
+```powershell
+.\build\win-release\NexusStream60.exe --list-decoders
+.\build\win-release\NexusStream60.exe --decoder-capabilities
+```
+
+The capability report checks D3D11VA creation and transfer formats, D3D11/Vulkan adapter LUIDs, NV12 external-memory import, and external synchronization support. Capability support does not by itself prove the live path.
+
+## Recorded-file playback
 
 ```powershell
 .\build\win-release\NexusStream60.exe `
   --input '.\samples\ui_text_720p60.mp4' `
-  --width 1920 --height 1080 --upscale bilinear --loop
+  --width 1920 --height 1080 `
+  --upscale fsr1-easu-rcas --rcas-sharpness 0.25 --loop
 ```
 
-Paths with spaces are supported. Expected input is H.264 High Profile, even-sized 8-bit `yuv420p`/`yuvj420p`, explicit supported range/matrix metadata, and left-sited chroma. The verified baseline is 1280×720, limited-range BT.709 at approximately 59.8–59.9 FPS. Timing always comes from decoded presentation timestamps, not a 60 Hz assumption.
+Expected input is even-sized 8-bit H.264 `yuv420p`/`yuvj420p` with supported range and matrix metadata and left-sited chroma. The verified baseline samples are 1280×720, limited-range BT.709 at approximately 59.8–59.9 FPS. File timing uses decoded presentation timestamps rather than assuming 60 Hz.
 
-Controls: `Space` pause/resume, `Right` step while paused, `Home` restart, `F11` fullscreen, `Tab` telemetry, `S` screenshot, and `Escape` leave fullscreen/exit. Captures and adjacent JSON metadata are written under `captures/`.
+## Live SysDVR playback
 
-Useful options include `--fullscreen`, `--borderless`, `--vsync on|off`, `--validation on|off`, `--drop-late-frames`, and `--log-level trace|debug|info|warning|error|critical`. Run `--help` for the full list.
-
-## Troubleshooting
-
-- “No GLSL-to-SPIR-V compiler”: set `VULKAN_SDK` and ensure its `Bin` directory contains `glslc.exe` or `glslangValidator.exe`.
-- “FFmpeg development files were not found”: use the manifest toolchain or point `FFMPEG_ROOT` at development headers and import libraries. `ffmpeg.exe` does not contain them.
-- Missing validation layer: install the SDK or pass `--validation off`; Release defaults off.
-- Unsupported/unspecified color metadata: inspect the file with `scripts/validate-samples.ps1`. Phase 1 rejects ambiguity instead of guessing and producing subtly wrong color.
-- Black output or validation errors: update the GPU driver, run Debug with validation, and include the selected-GPU/format startup log in reports.
-
-Architecture and ownership details are in [Phase 1 architecture](docs/phase1-architecture.md); the sample test matrix is in [Phase 1 validation](docs/phase1-validation.md).
-
-## Spatial quality milestone
-
-Eight live modes are available: `nearest`, `bilinear`, `bicubic`, `lanczos2`, `bilinear-cas`, `lanczos2-cas`, `fsr1-easu`, and `fsr1-easu-rcas`. EASU/RCAS use the pinned official AMD FidelityFX FSR1 source; standalone CAS uses the official FidelityFX CAS source. Copyright and MIT notices are preserved under `third_party/fidelityfx-fsr1/`.
+For a unified launch, let NexusStream60 start the bridge and create a unique pipe:
 
 ```powershell
 .\build\win-release\NexusStream60.exe `
-  --input '.\samples\flat_color_720p60.mp4' --width 1920 --height 1080 `
-  --upscale fsr1-easu-rcas --rcas-sharpness 0.25 --fullscreen --borderless --loop
-
-.\build\win-release\NexusStream60.exe `
-  --input '.\samples\ui_text_720p60.mp4' --compare bilinear,fsr1-easu-rcas `
-  --rcas-sharpness 0.25 --fullscreen --borderless --loop
+  --source sysdvr `
+  --sysdvr-bridge '.\artifacts\sysdvr-upscaler-bridge\win-x64\SysDVR-Client.exe' `
+  --quality-preset balanced --presentation exact `
+  --latency-profile balanced --live-frame-queue-depth 1 `
+  --fullscreen --borderless
 ```
 
-Live controls: number keys 1?8 select modes; `C` toggles split comparison; `A`/`B` assign the current mode to either side; drag the left mouse button to move the divider; `[`/`]` adjust active sharpness (hold Shift for larger steps); `Z` pauses and toggles the nearest-sampled zoom inspector. ImGui exposes exact CAS/RCAS values and anti-ringing.
+For a manual two-process launch, start NexusStream60 first:
 
-`--width`/`--height` request reconstruction and client framebuffer size. A decorated window may be constrained by the Windows work area; telemetry explicitly reports the actual framebuffer, viewport, final resample, and 1:1 status. Use borderless fullscreen for true 1920x1080 on a 1080p monitor. Exact-size presentation uses texel fetches and does not add another linear filter.
+```powershell
+.\build\win-release\NexusStream60.exe `
+  --source sysdvr-pipe --pipe-name SysDVR-Upscaler.Video `
+  --quality-preset balanced --presentation exact `
+  --latency-profile balanced --live-frame-queue-depth 1 `
+  --decoder d3d11va --decoder-path readback
+```
 
-Start conservatively at CAS 0.35 or RCAS 0.25. Spatial upscaling improves edge reconstruction and perceived readability, but a 720p source does not become true native 1080p detail. See [upscaler behavior](docs/upscalers.md), [presentation mapping](docs/presentation-mapping.md), and the [validation record](docs/upscale-comparison.md).
+Then start the bridge:
 
-## Phase 1.5 hardening status
+```powershell
+.\artifacts\sysdvr-upscaler-bridge\win-x64\SysDVR-Client.exe usb `
+  --upscaler-video-pipe SysDVR-Upscaler.Video `
+  --upscaler-pipe-queue-messages 16 `
+  --upscaler-pipe-queue-bytes 1048576 `
+  --upscaler-pipe-max-age-ms 50 --no-audio
+```
 
-This workspace includes a Phase 1.5 hardening pass for exact presentation geometry, corrected active-playback telemetry, and selectable YUV420 chroma reconstruction. New options include `--monitor`, `--final-filter`, and `--chroma-upscale`. See [Phase 1.5 quality hardening](docs/phase1-5-quality-hardening.md), [telemetry methodology](docs/telemetry-methodology.md), and [chroma reconstruction](docs/chroma-reconstruction.md).
+Decoder selection:
 
-NVIDIA Image Scaling, compression preprocessing, Nexus Adaptive Detail, presets, and repeatable multi-mode capture are documented as planned integration points and are not claimed as complete runtime modes in this pass.
+- `--decoder software` is the default software H.264 path.
+- `--decoder d3d11va --decoder-path readback` uses hardware decode, CPU NV12 readback, and the Phase 3.2 native NV12 Vulkan upload.
+- `--decoder auto` tries D3D11VA and falls back to software; it continues to use readback.
+- `--decoder d3d11va --decoder-path interop` is reserved for Phase 3.3 and currently exits with a clear not-implemented error.
+
+## Quality modes and controls
+
+Available modes are `nearest`, `bilinear`, `bicubic`, `lanczos2`, `bilinear-cas`, `lanczos2-cas`, `fsr1-easu`, and `fsr1-easu-rcas`. EASU/RCAS and standalone CAS use the pinned official AMD FidelityFX FSR1/CAS source under `third_party/fidelityfx-fsr1/`.
+
+Controls: `Space` pause/resume, `Right` step while paused, `Home` restart, `F11` fullscreen, `Tab` telemetry, `S` screenshot, and `Escape` leave fullscreen/exit. Number keys `1`–`8` select upscalers; `C` toggles comparison; `A`/`B` assign its sides; drag with the left mouse button to move the divider; `[`/`]` adjust sharpness; `Z` toggles the zoom inspector.
+
+Captures and adjacent JSON metadata are written under `captures/`. Use borderless fullscreen for exact 1920×1080 presentation on a 1080p display.
+
+## Documentation
+
+- [Phase 1 architecture](docs/phase1-architecture.md)
+- [Phase 1.5 quality hardening](docs/phase1-5-quality-hardening.md)
+- [Phase 2 live bridge](docs/phase2-live-bridge.md)
+- [Phase 3 software baseline](docs/phase3/software-baseline.md)
+- [Phase 3.1 D3D11VA readback](docs/phase3/d3d11va-readback.md)
+- [Phase 3.2 native NV12 upload](docs/phase3/nv12-vulkan-path.md)
+- [Phase 3.3 D3D11/Vulkan interop plan](docs/phase3/d3d11-vulkan-interop.md)
+- [Upscaler behavior](docs/upscalers.md), [presentation mapping](docs/presentation-mapping.md), and [telemetry methodology](docs/telemetry-methodology.md)
+
+NVIDIA Image Scaling, compression preprocessing, Nexus Adaptive Detail, presets, repeatable multi-mode capture, audio, and networking remain future work outside the current Phase 3.3 scope.
+
+## Troubleshooting
+
+- **No GLSL-to-SPIR-V compiler:** set `VULKAN_SDK` and confirm its `Bin` directory contains `glslc.exe` or `glslangValidator.exe`.
+- **FFmpeg development files were not found:** use the manifest toolchain or point `FFMPEG_ROOT` at a development tree containing `include` and `lib` directories.
+- **Missing validation layer:** install the Vulkan SDK or pass `--validation off`; Release defaults to validation off.
+- **Unsupported color metadata:** inspect recorded inputs with `scripts/validate-samples.ps1`.
+- **Interop selected but unavailable:** Phase 3.3 is not implemented; use `--decoder-path readback`.
+- **Black output or validation errors:** update the GPU driver, run Debug with validation enabled, and capture the selected GPU, decoder format, and frame-storage telemetry.
