@@ -49,6 +49,11 @@ std::optional<DecoderBackend> parseDecoderBackend(std::string_view text) {
     if(text=="auto") return DecoderBackend::Auto;
     return std::nullopt;
 }
+std::optional<DecoderPath> parseDecoderPath(std::string_view text) {
+    if(text=="readback") return DecoderPath::Readback;
+    if(text=="interop") return DecoderPath::D3D11VulkanInterop;
+    return std::nullopt;
+}
 void applyLatencyProfile(LatencyProfile profile, AppConfig& config) {
     config.latencyProfile = profile;
     switch(profile) {
@@ -126,6 +131,7 @@ ParseResult parseCommandLine(const std::vector<std::string>& args, bool defaultV
         else if(argument=="--upscaler-pipe-queue-bytes") { const auto* value=requireValue(argument);int parsed{};if(!value||!parseIntInRange(*value,parsed,64*1024,64*1024*1024))return{ParseAction::Run,std::nullopt,"--upscaler-pipe-queue-bytes requires an integer in [65536, 67108864]"};config.bridgePipeQueueBytes=parsed; }
         else if(argument=="--upscaler-pipe-max-age-ms") { const auto* value=requireValue(argument);int parsed{};if(!value||!parseIntInRange(*value,parsed,1,1000))return{ParseAction::Run,std::nullopt,"--upscaler-pipe-max-age-ms requires an integer in [1, 1000]"};config.bridgePipeMaxAgeMs=parsed; }
         else if(argument=="--decoder"||argument=="--decoder-backend") { const auto* value=requireValue(argument);const auto parsed=value?parseDecoderBackend(*value):std::nullopt;if(!parsed)return{ParseAction::Run,std::nullopt,"--decoder requires software, d3d11va, or auto"};config.decoderBackend=*parsed; }
+        else if(argument=="--decoder-path") { const auto* value=requireValue(argument);const auto parsed=value?parseDecoderPath(*value):std::nullopt;if(!parsed)return{ParseAction::Run,std::nullopt,"--decoder-path requires readback or interop"};config.decoderPath=*parsed; }
         else if(argument=="--quality-preset") { const auto* value=requireValue(argument); if(!value||!applyQualityPreset(*value,config))return{ParseAction::Run,std::nullopt,"--quality-preset requires balanced, performance, or quality"}; }
         else if(argument=="--width"||argument=="--height") { const auto* value=requireValue(argument);int parsed{};if(!value||!parsePositiveInt(*value,parsed))return{ParseAction::Run,std::nullopt,argument+" requires an integer in [1, 16384]"};(argument=="--width"?config.outputWidth:config.outputHeight)=parsed; }
         else if(argument=="--monitor") { const auto* value=requireValue(argument);int parsed{};if(!value||!parseNonNegativeInt(*value,parsed))return{ParseAction::Run,std::nullopt,"--monitor requires a non-negative integer monitor index"};config.monitorIndex=parsed; }
@@ -145,6 +151,7 @@ ParseResult parseCommandLine(const std::vector<std::string>& args, bool defaultV
     if(config.source!=SourceKind::File&&config.loop)return{ParseAction::Run,std::nullopt,"--loop is only valid with file input"};
     if(config.source==SourceKind::SysDvr&&config.sysdvrBridge.empty())return{ParseAction::Run,std::nullopt,"--source sysdvr requires --sysdvr-bridge <path>"};
     if(config.pipeName.empty())return{ParseAction::Run,std::nullopt,"--pipe-name requires a non-empty pipe name"};
+    if(config.decoderPath==DecoderPath::D3D11VulkanInterop&&config.decoderBackend!=DecoderBackend::D3D11VA)return{ParseAction::Run,std::nullopt,"--decoder-path interop requires --decoder d3d11va"};
     if(config.borderless)config.fullscreen=true;
     return{ParseAction::Run,std::move(config),{}};
 }
@@ -166,7 +173,8 @@ Input options:
   --upscaler-pipe-queue-messages <n> Managed bridge queue message cap
   --upscaler-pipe-queue-bytes <n> Managed bridge queue byte cap
   --upscaler-pipe-max-age-ms <n> Managed bridge oldest-payload age cap
-  --decoder <backend>       software|d3d11va|auto (default software)
+  --decoder <backend>         software|d3d11va|auto (default software)
+  --decoder-path <path>       readback|interop (default readback; interop is Phase 3.3 scaffold)
 
 Diagnostics:
   --list-decoders           List software and FFmpeg hardware decoder inventory

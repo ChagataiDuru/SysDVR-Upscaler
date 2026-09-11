@@ -19,6 +19,7 @@ enum class LatencyProfile { Quality, Balanced, Ultra };
 struct AppConfig {
     SourceKind source{SourceKind::File};
     DecoderBackend decoderBackend{DecoderBackend::Software};
+    DecoderPath decoderPath{DecoderPath::Readback};
     LatencyProfile latencyProfile{LatencyProfile::Balanced};
     std::filesystem::path input;
     std::string pipeName{"SysDVR-Upscaler.Video"};

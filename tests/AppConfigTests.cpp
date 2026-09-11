@@ -130,3 +130,20 @@ TEST_CASE("CLI parses decoder backend selection") {
 
     CHECK_FALSE(ns60::parseCommandLine({"app", "--input", "x.mp4", "--decoder", "cuda"}, false).config);
 }
+
+TEST_CASE("CLI defaults to decoder readback path") {
+    const auto result = ns60::parseCommandLine({"app", "--input", "x.mp4"}, false);
+    REQUIRE(result.config);
+    CHECK(static_cast<int>(result.config->decoderPath) == static_cast<int>(ns60::DecoderPath::Readback));
+}
+
+TEST_CASE("CLI scaffolds explicit D3D11 Vulkan interop") {
+    const auto result = ns60::parseCommandLine({"app", "--source", "sysdvr-pipe", "--decoder", "d3d11va",
+        "--decoder-path", "interop"}, false);
+    REQUIRE(result.config);
+    CHECK(static_cast<int>(result.config->decoderPath) == static_cast<int>(ns60::DecoderPath::D3D11VulkanInterop));
+
+    CHECK_FALSE(ns60::parseCommandLine({"app", "--input", "x.mp4", "--decoder-path", "interop"}, false).config);
+    CHECK_FALSE(ns60::parseCommandLine({"app", "--input", "x.mp4", "--decoder", "auto", "--decoder-path", "interop"}, false).config);
+    CHECK_FALSE(ns60::parseCommandLine({"app", "--input", "x.mp4", "--decoder-path", "zero-copy"}, false).config);
+}

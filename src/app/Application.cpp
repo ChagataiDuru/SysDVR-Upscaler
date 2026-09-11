@@ -224,6 +224,9 @@ BridgeProcess launchSysDvrBridge(const AppConfig&) {
 } // namespace
 
 int runApplication(AppConfig config) {
+    if (config.decoderPath == DecoderPath::D3D11VulkanInterop) {
+        throw std::runtime_error("D3D11/Vulkan interop is scaffolded for Phase 3.3 but not implemented; use --decoder-path readback");
+    }
     std::optional<BridgeProcess> bridgeProcess;
     if (config.source == SourceKind::SysDvr) {
         config.pipeName = makeUniquePipeName();
@@ -240,6 +243,7 @@ int runApplication(AppConfig config) {
     Log::info("Source: " + std::string(toString(config.source)));
     Log::info("Playback policy: " + std::string(toString(playbackPolicy)));
     Log::info("Decoder backend request: " + std::string(toString(config.decoderBackend)));
+    Log::info("Decoder path: " + std::string(toString(config.decoderPath)));
     if (playbackPolicy == PlaybackPolicy::ImmediateLive) {
         Log::info(std::format("Latency profile: {}, live decoded queue depth {}, bridge queue {} messages / {} bytes / {} ms",
             toString(config.latencyProfile), config.liveFrameQueueDepth, config.bridgePipeQueueMessages,
