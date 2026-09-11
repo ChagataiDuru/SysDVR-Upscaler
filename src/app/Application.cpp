@@ -44,6 +44,10 @@ using Clock = std::chrono::steady_clock;
 
 void copyOwnedFrame(Yuv420FrameSlot& destination, const Yuv420FrameSlot& source) {
     destination.metadata = source.metadata;
+    destination.storage = source.storage;
+    destination.yStride = source.yStride;
+    destination.uStride = source.uStride;
+    destination.vStride = source.vStride;
     std::memcpy(destination.yPlane.data(), source.yPlane.data(), source.yPlane.size());
     std::memcpy(destination.uPlane.data(), source.uPlane.data(), source.uPlane.size());
     std::memcpy(destination.vPlane.data(), source.vPlane.data(), source.vPlane.size());

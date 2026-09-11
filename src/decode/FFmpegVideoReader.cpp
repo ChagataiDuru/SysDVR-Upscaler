@@ -90,25 +90,20 @@ void copyPlane(std::vector<std::byte>& output, int outputStride, const std::uint
 }
 
 void copyPlanar420Frame(Yuv420FrameSlot& destination, const AVFrame& source) {
+    destination.storage = DecodedFrameStorage::CpuYuv420P;
+    destination.uStride = source.width / 2;
+    destination.vStride = source.width / 2;
     copyPlane(destination.yPlane, destination.yStride, source.data[0], source.linesize[0], source.width, source.height);
     copyPlane(destination.uPlane, destination.uStride, source.data[1], source.linesize[1], source.width / 2, source.height / 2);
     copyPlane(destination.vPlane, destination.vStride, source.data[2], source.linesize[2], source.width / 2, source.height / 2);
 }
 
 void copyNv12Frame(Yuv420FrameSlot& destination, const AVFrame& source) {
+    destination.storage = DecodedFrameStorage::CpuNv12;
+    destination.uStride = source.width;
+    destination.vStride = source.width / 2;
     copyPlane(destination.yPlane, destination.yStride, source.data[0], source.linesize[0], source.width, source.height);
-    if (!source.data[1]) throw std::runtime_error("Decoder returned a null NV12 chroma plane");
-    const int chromaWidth = source.width / 2;
-    const int chromaHeight = source.height / 2;
-    for (int row = 0; row < chromaHeight; ++row) {
-        const auto* input = source.data[1] + static_cast<std::ptrdiff_t>(row) * source.linesize[1];
-        auto* uOutput = destination.uPlane.data() + static_cast<std::size_t>(row * destination.uStride);
-        auto* vOutput = destination.vPlane.data() + static_cast<std::size_t>(row * destination.vStride);
-        for (int column = 0; column < chromaWidth; ++column) {
-            uOutput[column] = static_cast<std::byte>(input[column * 2]);
-            vOutput[column] = static_cast<std::byte>(input[column * 2 + 1]);
-        }
-    }
+    copyPlane(destination.uPlane, destination.uStride, source.data[1], source.linesize[1], source.width, source.height / 2);
 }
 
 std::vector<AVPixelFormat> preferredTransferFormats(AVBufferRef* device) {
@@ -121,10 +116,10 @@ std::vector<AVPixelFormat> preferredTransferFormats(AVBufferRef* device) {
     }
     if (constraints) av_hwframe_constraints_free(&constraints);
 
-    if (supported.empty()) return {AV_PIX_FMT_YUV420P, AV_PIX_FMT_NV12};
+    if (supported.empty()) return {AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P};
 
     std::vector<AVPixelFormat> ordered;
-    for (const AVPixelFormat preferred : {AV_PIX_FMT_YUV420P, AV_PIX_FMT_NV12, AV_PIX_FMT_YUVJ420P}) {
+    for (const AVPixelFormat preferred : {AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUVJ420P}) {
         if (std::find(supported.begin(), supported.end(), preferred) != supported.end()) ordered.push_back(preferred);
     }
     return ordered;
@@ -486,6 +481,7 @@ struct FFmpegVideoReader::Impl {
                     timingKind,
                     {mapRange(bestRange(outputFrame->color_range, codec->color_range), allowMetadataDefaults),
                      mapMatrix(bestMatrix(outputFrame->colorspace, codec->colorspace), allowMetadataDefaults)}};
+                destination.metadata.storage = destination.storage;
                 timing.decodeMs = std::chrono::duration<double, std::milli>(decodedAt - operationStart).count();
                 timing.copyMs = std::chrono::duration<double, std::milli>(copyEnd - copyStart).count();
                 av_frame_unref(transferFrame.get());

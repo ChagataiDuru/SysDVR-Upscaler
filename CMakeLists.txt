@@ -62,6 +62,7 @@ if(NS60_BUILD_APP)
   include(CompileShaders)
   ns60_compile_shaders(NexusStream60
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/yuv420p_to_rgb.comp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/nv12_to_rgb.comp"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/bilinear_upscale.comp"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/upscale_nearest.comp"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/upscale_bicubic_catmull_rom.comp"

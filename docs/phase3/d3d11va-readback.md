@@ -1,6 +1,6 @@
 # Phase 3.1 D3D11VA Readback Decode
 
-Phase 3.1 adds an opt-in FFmpeg D3D11VA H.264 backend. It keeps the renderer and frame queue unchanged: decoded D3D11 hardware frames are transferred back to CPU memory and normalized into the existing owned planar YUV420 frame slots before Vulkan upload.
+Phase 3.1 added an opt-in FFmpeg D3D11VA H.264 backend. At that point, decoded D3D11 hardware frames were transferred back to CPU memory and normalized into the existing owned planar YUV420 frame slots before Vulkan upload.
 
 ## Backend Selection
 
@@ -32,8 +32,8 @@ Decoder backend: requested d3d11va, active d3d11va
 Active decoder backend: d3d11va
 ```
 
-Telemetry shows `Decoder backend: d3d11va` and a codec/format similar to `h264 / d3d11 -> CPU yuv420p` or `h264 / d3d11 -> CPU nv12`.
+Telemetry shows `Decoder backend: d3d11va` and a codec/format similar to `h264 / d3d11 -> CPU nv12`. Phase 3.2 also reports `Frame storage: CPU NV12` when the direct NV12 Vulkan upload path is active.
 
 ## Design Boundary
 
-This is not zero-copy yet. The decode engine moves from CPU software decode to D3D11VA hardware decode, but frames still return to CPU memory before entering the existing Vulkan upload/color/upscale path. Phase 3.2 can use this as the behavior baseline before introducing a native NV12 Vulkan path.
+This is not zero-copy yet. The decode engine moves from CPU software decode to D3D11VA hardware decode, but frames still return to CPU memory. Phase 3.2 removes the extra CPU planar U/V conversion by uploading CPU NV12 directly into Vulkan Y and interleaved UV images before shader color conversion.

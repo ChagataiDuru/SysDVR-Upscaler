@@ -191,3 +191,12 @@ TEST_CASE("FrameQueue latest policy supports depth one replacement") {
     CHECK(pool.at(*read).metadata.frameNumber == 2);
     queue.releaseRead(*read);
 }
+TEST_CASE("FramePool allocates NV12-capable chroma storage") {
+    ns60::FramePool pool(1, 16, 16);
+    auto& slot = pool.at(0);
+    CHECK(slot.yPlane.size() == 16 * 16);
+    CHECK(slot.uPlane.size() >= 16 * 16 / 2);
+    CHECK(slot.vPlane.size() == 8 * 8);
+    CHECK(static_cast<int>(slot.storage) == static_cast<int>(ns60::DecodedFrameStorage::CpuYuv420P));
+    CHECK(static_cast<int>(slot.metadata.storage) == static_cast<int>(ns60::DecodedFrameStorage::CpuYuv420P));
+}

@@ -80,13 +80,14 @@ private:
     struct ImageResource { VkImage image{}; VkDeviceMemory memory{}; VkImageView view{}; VkFormat format{}; VkExtent2D extent{}; };
     struct FlightResources {
         BufferResource staging, readback;
-        ImageResource y, u, v, working, intermediate, output, comparisonOutput;
-        VkDescriptorSet colorSet{};
+        ImageResource y, u, v, uv, working, intermediate, output, comparisonOutput;
+        VkDescriptorSet colorSet{}, nv12ColorSet{};
         std::array<VkDescriptorSet, 5> processSets{};
         VkDescriptorSet presentSet{};
-        bool initialized{}, screenshotPending{};
+        bool initialized{}, planarInitialized{}, nv12Initialized{}, screenshotPending{};
         std::optional<ScreenshotRequest> screenshot;
         ColorDescription color{};
+        DecodedFrameStorage storage{DecodedFrameStorage::CpuYuv420P};
     };
     enum ProcessSet : std::size_t { WorkingToOutput, WorkingToIntermediate, IntermediateToOutput, WorkingToComparison, IntermediateToComparison };
     enum Pipeline : std::size_t { Nearest, Bilinear, Bicubic, Lanczos2, Cas, Easu, Rcas, PipelineCount };
@@ -114,7 +115,7 @@ private:
     VkDescriptorPool descriptorPool_{};
     VkDescriptorSetLayout colorLayout_{}, processLayout_{}, presentLayout_{};
     VkPipelineLayout colorPipelineLayout_{}, processPipelineLayout_{}, presentPipelineLayout_{};
-    VkPipeline colorPipeline_{}, presentPipeline_{};
+    VkPipeline colorPipeline_{}, nv12ColorPipeline_{}, presentPipeline_{};
     std::array<VkPipeline, PipelineCount> pipelines_{};
     std::array<FlightResources, VulkanContext::framesInFlight> flights_{};
     std::optional<ScreenshotRequest> screenshotRequest_;

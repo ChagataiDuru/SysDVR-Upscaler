@@ -114,10 +114,12 @@ void ImGuiOverlay::build(const Metrics& metrics, const std::optional<VideoFrameM
                 if (stream_.live || current->timingKind == FrameTimingKind::LiveArrival) {
                     ImGui::TextUnformatted("Frame timing: live arrival (container PTS N/A)");
                     ImGui::Text("Decoded live frame: %llu", static_cast<unsigned long long>(current->frameNumber));
+                    ImGui::Text("Frame storage: %s", toString(current->storage).data());
                 } else {
                     ImGui::Text("PTS / delta / duration: %.6f s / %.3f ms / %.3f ms", current->ptsSeconds,
                         metrics.ptsDeltaMs.latest(), current->durationSeconds * 1000.0);
                     ImGui::Text("Decoded frame: %llu", static_cast<unsigned long long>(current->frameNumber));
+                    ImGui::Text("Frame storage: %s", toString(current->storage).data());
                 }
             }
             ImGui::Separator();
