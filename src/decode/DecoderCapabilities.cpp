@@ -76,9 +76,13 @@ struct VulkanDeviceSummary {
     bool externalSemaphoreWin32{};
     bool externalFence{};
     bool externalFenceWin32{};
+    bool timelineSemaphore{};
     bool d3d11TextureImportRgba8{};
     bool d3d11TextureImportNv12{};
+    bool ycbcrImageArraysExtension{};
+    bool ycbcrImageArraysFeature{};
     bool externalSemaphoreImportExport{};
+    bool d3d11FenceSemaphoreImport{};
     bool externalFenceImportExport{};
     LuidSummary luid;
 };
@@ -234,6 +238,7 @@ bool queryExternalImageImport(PFN_vkGetPhysicalDeviceImageFormatProperties2 getI
     imageInfo.type = VK_IMAGE_TYPE_2D;
     imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
     imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+    imageInfo.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     VkExternalImageFormatProperties externalProperties{VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES};
     VkImageFormatProperties2 imageProperties{VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
     imageProperties.pNext = &externalProperties;
@@ -259,6 +264,22 @@ bool queryExternalSemaphoreImportExport(PFN_vkGetPhysicalDeviceExternalSemaphore
     getSemaphoreProperties(device, &info, &properties);
     constexpr VkExternalSemaphoreFeatureFlags required = VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT | VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT;
     return (properties.externalSemaphoreFeatures & required) == required;
+}
+
+bool queryD3D11FenceSemaphoreImport(PFN_vkGetPhysicalDeviceExternalSemaphoreProperties getSemaphoreProperties,
+                                    VkPhysicalDevice device) {
+#ifdef _WIN32
+    if (!getSemaphoreProperties) return false;
+    VkPhysicalDeviceExternalSemaphoreInfo info{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO};
+    info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D11_FENCE_BIT;
+    VkExternalSemaphoreProperties properties{VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES};
+    getSemaphoreProperties(device, &info, &properties);
+    return (properties.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT) != 0;
+#else
+    (void)getSemaphoreProperties;
+    (void)device;
+    return false;
+#endif
 }
 
 bool queryExternalFenceImportExport(PFN_vkGetPhysicalDeviceExternalFenceProperties getFenceProperties, VkPhysicalDevice device) {
@@ -292,7 +313,7 @@ int physicalDeviceScore(const VulkanDeviceSummary& device) {
     return 10;
 }
 
-VulkanAudit queryVulkanAudit() {
+VulkanAudit queryVulkanAudit(const LuidSummary* requiredLuid) {
     VulkanAudit audit;
     std::uint32_t loaderVersion = VK_API_VERSION_1_0;
     if (const auto enumerateVersion = reinterpret_cast<PFN_vkEnumerateInstanceVersion>(vkGetInstanceProcAddr(nullptr, "vkEnumerateInstanceVersion"))) {
@@ -364,8 +385,20 @@ VulkanAudit queryVulkanAudit() {
         device.supportsTimestamp = properties.limits.timestampComputeAndGraphics == VK_TRUE;
         device.hasGraphicsComputeQueue = hasGraphicsComputeQueue(physicalDevice);
         device.supportsRgba16StorageSampled = supportsRgba16StorageSampled(physicalDevice);
-
         const auto extensions = enumerateDeviceExtensions(physicalDevice);
+        device.ycbcrImageArraysExtension = hasExtension(extensions, VK_EXT_YCBCR_IMAGE_ARRAYS_EXTENSION_NAME);
+        VkPhysicalDeviceYcbcrImageArraysFeaturesEXT ycbcrArrays{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_YCBCR_IMAGE_ARRAYS_FEATURES_EXT};
+        VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcrConversion{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES};
+        VkPhysicalDeviceTimelineSemaphoreFeatures timeline{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+        timeline.pNext = &ycbcrConversion;
+        if (device.ycbcrImageArraysExtension) ycbcrConversion.pNext = &ycbcrArrays;
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        features.pNext = &timeline;
+        vkGetPhysicalDeviceFeatures2(physicalDevice, &features);
+        device.timelineSemaphore = timeline.timelineSemaphore == VK_TRUE;
+        device.ycbcrImageArraysFeature = device.ycbcrImageArraysExtension &&
+            ycbcrConversion.samplerYcbcrConversion == VK_TRUE && ycbcrArrays.ycbcrImageArrays == VK_TRUE;
+
         device.externalMemory = hasExtension(extensions, VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME);
         device.externalSemaphore = hasExtension(extensions, VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME);
         device.externalFence = hasExtension(extensions, VK_KHR_EXTERNAL_FENCE_EXTENSION_NAME);
@@ -377,9 +410,12 @@ VulkanAudit queryVulkanAudit() {
         device.d3d11TextureImportRgba8 = queryExternalImageImport(getImageProperties2, physicalDevice, VK_FORMAT_R8G8B8A8_UNORM);
         device.d3d11TextureImportNv12 = queryExternalImageImport(getImageProperties2, physicalDevice, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM);
         device.externalSemaphoreImportExport = queryExternalSemaphoreImportExport(getSemaphoreProperties, physicalDevice);
+        device.d3d11FenceSemaphoreImport = queryD3D11FenceSemaphoreImport(getSemaphoreProperties, physicalDevice);
         device.externalFenceImportExport = queryExternalFenceImportExport(getFenceProperties, physicalDevice);
 
-        const int score = physicalDeviceScore(device);
+        const bool luidMatches = !requiredLuid ||
+            (requiredLuid->valid && device.luid.valid && requiredLuid->bytes == device.luid.bytes);
+        const int score = luidMatches ? physicalDeviceScore(device) : -1;
         const std::size_t index = audit.devices.size();
         if (score > bestScore) {
             bestScore = score;
@@ -512,12 +548,19 @@ void appendVulkanAudit(std::ostringstream& output, const VulkanAudit& vulkan) {
            << ", win32=" << yesNo(device.externalMemoryWin32) << "\n";
     output << "D3D11 texture import: rgba8=" << yesNo(device.d3d11TextureImportRgba8)
            << ", nv12=" << yesNo(device.d3d11TextureImportNv12) << "\n";
+    output << "Y'CbCr image arrays (layered NV12 import): extension=" << yesNo(device.ycbcrImageArraysExtension)
+           << ", feature=" << yesNo(device.ycbcrImageArraysFeature) << "\n";
     output << "External sync extensions: semaphore=" << yesNo(device.externalSemaphore)
            << ", semaphore_win32=" << yesNo(device.externalSemaphoreWin32)
            << ", fence=" << yesNo(device.externalFence)
            << ", fence_win32=" << yesNo(device.externalFenceWin32) << "\n";
     output << "External sync import/export query: semaphore=" << yesNo(device.externalSemaphoreImportExport)
            << ", fence=" << yesNo(device.externalFenceImportExport) << "\n";
+    output << "Interop features: timeline semaphore=" << yesNo(device.timelineSemaphore)
+           << ", timeline D3D11_FENCE import=" << yesNo(device.d3d11FenceSemaphoreImport) << "\n";
+    output << "Strict D3D11/Vulkan zero-copy: unsupported on the tested NVIDIA driver (imported multi-planar NV12 fault)\n";
+    output << "Selected production interop strategy: interop-copy (GPU-resident R8/R8G8 shared planes)\n";
+    output << "Actual decoder texture import: not attempted (run an H.264 stream with --decoder d3d11va --decoder-path interop-copy)\n";
 }
 } // namespace
 
@@ -538,7 +581,7 @@ std::string decoderCapabilitiesReport() {
     const AVCodec* h264Decoder = avcodec_find_decoder(AV_CODEC_ID_H264);
     const auto d3d11va = queryFFmpegDevice(AV_HWDEVICE_TYPE_D3D11VA);
     const auto d3d11 = queryD3D11DefaultAdapter();
-    const auto vulkan = queryVulkanAudit();
+    const auto vulkan = queryVulkanAudit(d3d11.available ? &d3d11.luid : nullptr);
 
     std::ostringstream output;
     output << "NexusStream60 Phase 3 decoder capability report\n";

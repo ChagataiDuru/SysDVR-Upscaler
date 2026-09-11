@@ -4,6 +4,7 @@
 #include "render/Upscaling.h"
 
 #include <filesystem>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -46,6 +47,7 @@ struct AppConfig {
     bool vsync{true};
     bool validation{};
     bool dropLateFrames{};
+    std::optional<std::uint64_t> captureFrame;
     LogLevel logLevel{LogLevel::Info};
 };
 

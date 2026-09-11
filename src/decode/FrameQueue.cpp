@@ -41,6 +41,7 @@ std::optional<std::size_t> FrameQueue::acquireWriteLatest() {
     readPos_ = (readPos_ + 1) % readyRing_.size();
     --readyCount_;
     if (states_[slot] != SlotState::Ready) throw std::logic_error("FrameQueue state corruption while dropping a stale frame");
+    pool_.at(slot).resetPayload();
     states_[slot] = SlotState::Writing;
     ++staleDrops_;
     return slot;
@@ -66,6 +67,7 @@ void FrameQueue::cancelWrite(std::size_t slot) {
         if (slot >= states_.size() || states_[slot] != SlotState::Writing) {
             throw std::logic_error("cancelWrite called for a slot not owned by the producer");
         }
+        pool_.at(slot).resetPayload();
         states_[slot] = SlotState::Free;
     }
     writable_.notify_one();
@@ -98,6 +100,7 @@ std::optional<std::size_t> FrameQueue::tryAcquireNewest() {
         --readyCount_;
         if (states_[slot] != SlotState::Ready) throw std::logic_error("FrameQueue state corruption while acquiring newest frame");
         if (newest) {
+            pool_.at(*newest).resetPayload();
             states_[*newest] = SlotState::Free;
             ++staleDrops_;
         }
@@ -115,15 +118,42 @@ void FrameQueue::releaseRead(std::size_t slot) {
         if (slot >= states_.size() || states_[slot] != SlotState::Reading) {
             throw std::logic_error("releaseRead called for a slot not owned by the consumer");
         }
+        pool_.at(slot).resetPayload();
         states_[slot] = SlotState::Free;
     }
     writable_.notify_one();
+}
+
+void FrameQueue::discardReady() noexcept {
+    {
+        std::lock_guard lock(mutex_);
+        while (readyCount_ != 0) {
+            const auto slot = readyRing_[readPos_];
+            readPos_ = (readPos_ + 1) % readyRing_.size();
+            --readyCount_;
+            if (states_[slot] == SlotState::Ready) {
+                pool_.at(slot).resetPayload();
+                states_[slot] = SlotState::Free;
+                ++staleDrops_;
+            }
+        }
+    }
+    writable_.notify_all();
 }
 
 void FrameQueue::stop() noexcept {
     {
         std::lock_guard lock(mutex_);
         stopped_ = true;
+        while (readyCount_ != 0) {
+            const auto slot = readyRing_[readPos_];
+            readPos_ = (readPos_ + 1) % readyRing_.size();
+            --readyCount_;
+            if (states_[slot] == SlotState::Ready) {
+                pool_.at(slot).resetPayload();
+                states_[slot] = SlotState::Free;
+            }
+        }
     }
     readable_.notify_all();
     writable_.notify_all();

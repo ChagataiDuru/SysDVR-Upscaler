@@ -68,6 +68,7 @@ void ImGuiOverlay::build(const Metrics& metrics, const std::optional<VideoFrameM
             ImGui::Text("Input: %s", filename.c_str());
             ImGui::Text("Codec / format: %s / %s", stream_.codecName.c_str(), stream_.pixelFormatName.c_str());
             ImGui::Text("Decoder backend: %s", toString(stream_.activeDecoderBackend).data());
+            ImGui::Text("Decoder path: %s", toString(stream_.activeDecoderPath).data());
             ImGui::Text("Input / output: %dx%d / %dx%d", stream_.width, stream_.height, outputWidth_, outputHeight_);
             ImGui::Text("Color: %s, %s, transfer %s", toString(stream_.color.range), toString(stream_.color.matrix), stream_.transfer.c_str());
             if (stream_.live) {
@@ -141,7 +142,15 @@ void ImGuiOverlay::build(const Metrics& metrics, const std::optional<VideoFrameM
                 metricRow("Frame lateness", metrics.latenessMs);
             }
             metricRow("CPU decode", metrics.decodeMs);
-            metricRow("CPU plane copy", metrics.planeCopyMs);
+            metricRow(stream_.activeDecoderPath == DecoderPath::D3D11VulkanInteropCopy
+                          ? "CPU D3D copy submit" : "CPU plane copy",
+                      metrics.planeCopyMs);
+            metricRow("CPU Vulkan upload", metrics.cpuUploadMs);
+            ImGui::Text("CPU copy / upload bytes: %llu / %llu",
+                static_cast<unsigned long long>(metrics.cpuCopyBytes),
+                static_cast<unsigned long long>(metrics.cpuUploadBytes));
+            if (usesD3D11VulkanInterop(stream_.activeDecoderPath))
+                ImGui::TextUnformatted("GPU interop semaphore wait: N/A (asynchronous timeline wait)");
             metricRow("CPU decoder wait", metrics.decoderWaitMs);
             metricRow("CPU frame", metrics.cpuFrameMs);
             metricRow("Active frame time", metrics.activeFrameTimeMs);

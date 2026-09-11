@@ -2,7 +2,7 @@
 
 SysDVR-Upscaler is a Windows-first C++20/Vulkan client for low-latency Nintendo Switch SysDVR video. It accepts recorded H.264 captures or a live SysDVR bridge stream, performs explicit YUV color reconstruction, and compares spatial upscalers before presentation.
 
-The current implementation includes software decode, optional FFmpeg D3D11VA decode, direct CPU-NV12 upload into Vulkan, eight upscaling modes, split comparison, timing telemetry, and screenshots. D3D11/Vulkan zero-copy interop is designed and CLI-scaffolded for Phase 3.3, but is not implemented yet.
+The current implementation includes software decode, optional FFmpeg D3D11VA decode, direct CPU-NV12 upload into Vulkan, a validated GPU-resident D3D11/Vulkan interop-copy path, eight upscaling modes, split comparison, timing telemetry, and screenshots. Strict imported-NV12 zero-copy is intentionally unavailable on the tested NVIDIA driver.
 
 ## Milestone status
 
@@ -14,7 +14,7 @@ The current implementation includes software decode, optional FFmpeg D3D11VA dec
 | Phase 3.0: decoder and interop capability reporting | Implemented |
 | Phase 3.1: D3D11VA decode with CPU readback | Implemented |
 | Phase 3.2: native CPU-NV12 Vulkan upload | Implemented; manual hardware comparison remains pending |
-| Phase 3.3: D3D11/Vulkan zero-copy NV12 | Planned; inactive scaffold only |
+| Phase 3.3: D3D11/Vulkan NV12 interop | Closed with `interop-copy`: pixel-exact on all three recorded samples and faster than readback; strict imported-NV12 zero-copy is unsupported on NVIDIA 616.92; Switch hardware acceptance pending |
 
 Do not treat the Phase 2 or Phase 3 status as a completed hardware-success claim. USB disconnect/reconnect, visual comparison, and a 30-minute live soak still need to be run on Switch hardware.
 
@@ -47,6 +47,8 @@ cmake --build --preset core-tests
 ctest --preset core-tests
 ```
 
+On a Windows GPU host, enable the opt-in recorded-file interop-copy tests with `-DNS60_ENABLE_GPU_TESTS=ON`; they compare `flat_color`, `ui_text`, and `fast_motion` against readback with validation enabled.
+
 Build the managed SysDVR bridge separately when using live input:
 
 ```powershell
@@ -62,7 +64,7 @@ These commands do not require an input file:
 .\build\win-release\NexusStream60.exe --decoder-capabilities
 ```
 
-The capability report checks D3D11VA creation and transfer formats, D3D11/Vulkan adapter LUIDs, NV12 external-memory import, and external synchronization support. Capability support does not by itself prove the live path.
+The capability report separately shows extension availability, NV12/D3D11-fence feature support, and whether a real decoder texture has been imported. The standalone report cannot perform the last check without an H.264 stream.
 
 ## Recorded-file playback
 
@@ -83,6 +85,7 @@ For a unified launch, let NexusStream60 start the bridge and create a unique pip
 .\build\win-release\NexusStream60.exe `
   --source sysdvr `
   --sysdvr-bridge '.\artifacts\sysdvr-upscaler-bridge\win-x64\SysDVR-Client.exe' `
+  --decoder d3d11va --decoder-path interop-copy `
   --quality-preset balanced --presentation exact `
   --latency-profile balanced --live-frame-queue-depth 1 `
   --fullscreen --borderless
@@ -113,7 +116,8 @@ Decoder selection:
 - `--decoder software` is the default software H.264 path.
 - `--decoder d3d11va --decoder-path readback` uses hardware decode, CPU NV12 readback, and the Phase 3.2 native NV12 Vulkan upload.
 - `--decoder auto` tries D3D11VA and falls back to software; it continues to use readback.
-- `--decoder d3d11va --decoder-path interop` is reserved for Phase 3.3 and currently exits with a clear not-implemented error.
+- `--decoder d3d11va --decoder-path interop` is reserved for strict imported-NV12 zero-copy and exits with an explanatory unsupported error on the tested NVIDIA path; it never falls back silently.
+- `--decoder d3d11va --decoder-path interop-copy` is the recommended Windows D3D11VA fast path. Frames remain GPU-resident; one D3D11 copy and a plane-split compute pass produce shared R8/R8G8 textures for Vulkan. The portable global default remains `readback`.
 
 ## Quality modes and controls
 
@@ -131,10 +135,10 @@ Captures and adjacent JSON metadata are written under `captures/`. Use borderles
 - [Phase 3 software baseline](docs/phase3/software-baseline.md)
 - [Phase 3.1 D3D11VA readback](docs/phase3/d3d11va-readback.md)
 - [Phase 3.2 native NV12 upload](docs/phase3/nv12-vulkan-path.md)
-- [Phase 3.3 D3D11/Vulkan interop plan](docs/phase3/d3d11-vulkan-interop.md)
+- [Phase 3.3 D3D11/Vulkan interop](docs/phase3/d3d11-vulkan-interop.md)
 - [Upscaler behavior](docs/upscalers.md), [presentation mapping](docs/presentation-mapping.md), and [telemetry methodology](docs/telemetry-methodology.md)
 
-NVIDIA Image Scaling, compression preprocessing, Nexus Adaptive Detail, presets, repeatable multi-mode capture, audio, and networking remain future work outside the current Phase 3.3 scope.
+Direct Vulkan Video H.264 decode is the next true-zero-copy candidate. It requires rebuilding FFmpeg with Vulkan support and is deliberately a separate phase. NVIDIA Image Scaling, compression preprocessing, Nexus Adaptive Detail, presets, repeatable multi-mode capture, audio, and networking also remain future work.
 
 ## Troubleshooting
 
@@ -142,5 +146,5 @@ NVIDIA Image Scaling, compression preprocessing, Nexus Adaptive Detail, presets,
 - **FFmpeg development files were not found:** use the manifest toolchain or point `FFMPEG_ROOT` at a development tree containing `include` and `lib` directories.
 - **Missing validation layer:** install the Vulkan SDK or pass `--validation off`; Release defaults to validation off.
 - **Unsupported color metadata:** inspect recorded inputs with `scripts/validate-samples.ps1`.
-- **Interop selected but unavailable:** Phase 3.3 is not implemented; use `--decoder-path readback`.
+- **Interop selected but unavailable:** strict `interop` is intentionally unsupported on the tested NVIDIA driver. Use `--decoder-path interop-copy`; run `--decoder-capabilities` to inspect same-GPU LUID, Win32 external-memory, timeline semaphore, and D3D11-fence import support.
 - **Black output or validation errors:** update the GPU driver, run Debug with validation enabled, and capture the selected GPU, decoder format, and frame-storage telemetry.

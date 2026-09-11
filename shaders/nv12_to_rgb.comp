@@ -18,12 +18,12 @@ layout(push_constant) uniform ColorParameters {
 const float PI = 3.14159265358979323846;
 
 float fetchLuma(ivec2 q) {
-    ivec2 size = textureSize(yTexture, 0);
+    ivec2 size = color.extent;
     return texelFetch(yTexture, clamp(q, ivec2(0), size - 1), 0).r;
 }
 
 vec2 fetchUv(ivec2 q) {
-    ivec2 size = textureSize(uvTexture, 0);
+    ivec2 size = color.extent / 2;
     return texelFetch(uvTexture, clamp(q, ivec2(0), size - 1), 0).rg;
 }
 
@@ -52,7 +52,8 @@ vec2 chromaCoordinate(ivec2 pixel) {
 
 vec2 sampleBilinear(vec2 c) {
     vec2 size = vec2(textureSize(uvTexture, 0));
-    return texture(uvTexture, (c + vec2(0.5)) / size).rg;
+    vec2 logicalMax = vec2(color.extent / 2 - 1);
+    return texture(uvTexture, (clamp(c, vec2(0.0), logicalMax) + vec2(0.5)) / size).rg;
 }
 
 vec2 sampleBicubic(vec2 c) {

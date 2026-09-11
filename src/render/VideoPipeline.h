@@ -1,6 +1,7 @@
 #pragma once
 
 #include "decode/DecodedFrame.h"
+#include "render/D3D11VulkanInterop.h"
 #include "render/Upscaling.h"
 #include "render/VulkanContext.h"
 
@@ -8,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vulkan/vulkan.h>
@@ -38,8 +40,9 @@ struct ScreenshotRequest {
 class VideoPipeline final {
 public:
     VideoPipeline(VulkanContext& context, int sourceWidth, int sourceHeight, int outputWidth, int outputHeight,
-                  UpscaleMode mode, SharpenSettings sharpen, bool antiRinging, PresentationMode presentation,
-                  bool presentationExplicit, FinalFilter finalFilter, ChromaUpscaleMode chromaMode);
+                   UpscaleMode mode, SharpenSettings sharpen, bool antiRinging, PresentationMode presentation,
+                   bool presentationExplicit, FinalFilter finalFilter, ChromaUpscaleMode chromaMode,
+                   bool d3d11Interop = false);
     ~VideoPipeline();
     VideoPipeline(const VideoPipeline&) = delete;
     VideoPipeline& operator=(const VideoPipeline&) = delete;
@@ -74,6 +77,8 @@ public:
     void endPresent(VkCommandBuffer command, std::uint32_t flight);
     void requestScreenshot(ScreenshotRequest request);
     void completePendingScreenshot(std::uint32_t flight);
+    [[nodiscard]] std::optional<VulkanContext::TimelineWait> timelineWait(std::uint32_t flight) const noexcept;
+    void releaseInteropFrames() noexcept;
 
 private:
     struct BufferResource { VkBuffer buffer{}; VkDeviceMemory memory{}; void* mapped{}; VkDeviceSize size{}; bool coherent{}; };
@@ -88,6 +93,7 @@ private:
         std::optional<ScreenshotRequest> screenshot;
         ColorDescription color{};
         DecodedFrameStorage storage{DecodedFrameStorage::CpuYuv420P};
+        std::optional<PreparedInteropFrame> externalFrame;
     };
     enum ProcessSet : std::size_t { WorkingToOutput, WorkingToIntermediate, IntermediateToOutput, WorkingToComparison, IntermediateToComparison };
     enum Pipeline : std::size_t { Nearest, Bilinear, Bicubic, Lanczos2, Cas, Easu, Rcas, PipelineCount };
@@ -119,6 +125,7 @@ private:
     std::array<VkPipeline, PipelineCount> pipelines_{};
     std::array<FlightResources, VulkanContext::framesInFlight> flights_{};
     std::optional<ScreenshotRequest> screenshotRequest_;
+    std::unique_ptr<D3D11VulkanInterop> interop_;
     UpscaleParameters parameters_{};
     UpscaleMode mode_{UpscaleMode::Bilinear}, comparisonA_{UpscaleMode::Bilinear}, comparisonB_{UpscaleMode::Fsr1EasuRcas};
     PresentationMode presentationMode_{PresentationMode::Fit};

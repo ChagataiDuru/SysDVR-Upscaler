@@ -43,14 +43,20 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 void copyOwnedFrame(Yuv420FrameSlot& destination, const Yuv420FrameSlot& source) {
+    destination.resetPayload();
     destination.metadata = source.metadata;
     destination.storage = source.storage;
     destination.yStride = source.yStride;
     destination.uStride = source.uStride;
     destination.vStride = source.vStride;
-    std::memcpy(destination.yPlane.data(), source.yPlane.data(), source.yPlane.size());
-    std::memcpy(destination.uPlane.data(), source.uPlane.data(), source.uPlane.size());
-    std::memcpy(destination.vPlane.data(), source.vPlane.data(), source.vPlane.size());
+    if (source.storage == DecodedFrameStorage::D3D11Nv12) {
+        if (!source.d3d11Lease) throw std::runtime_error("D3D11 frame is missing its decoder-surface lease");
+        destination.d3d11Lease = source.d3d11Lease;
+    } else {
+        std::memcpy(destination.yPlane.data(), source.yPlane.data(), source.yPlane.size());
+        std::memcpy(destination.uPlane.data(), source.uPlane.data(), source.uPlane.size());
+        std::memcpy(destination.vPlane.data(), source.vPlane.data(), source.vPlane.size());
+    }
 }
 
 void waitForTarget(PlaybackClock::TimePoint target) {
@@ -225,7 +231,9 @@ BridgeProcess launchSysDvrBridge(const AppConfig&) {
 
 int runApplication(AppConfig config) {
     if (config.decoderPath == DecoderPath::D3D11VulkanInterop) {
-        throw std::runtime_error("D3D11/Vulkan interop is scaffolded for Phase 3.3 but not implemented; use --decoder-path readback");
+        throw std::runtime_error(
+            "Strict D3D11/Vulkan NV12 zero-copy is unsupported on the tested NVIDIA driver; "
+            "use --decoder-path interop-copy. Direct Vulkan Video decode is tracked as a separate future phase.");
     }
     std::optional<BridgeProcess> bridgeProcess;
     if (config.source == SourceKind::SysDvr) {
@@ -240,6 +248,11 @@ int runApplication(AppConfig config) {
     Log::info("Build configuration: Debug");
 #endif
     const auto playbackPolicy = playbackPolicyFor(config.source);
+    const bool liveMode = playbackPolicy == PlaybackPolicy::ImmediateLive;
+    const bool interopMode = usesD3D11VulkanInterop(config.decoderPath);
+    const std::size_t decodeSlots = liveMode ? static_cast<std::size_t>(std::max(2, config.liveFrameQueueDepth + 1)) : FramePool::defaultSlotCount;
+    const std::size_t externallyRetainedFrames = interopMode
+        ? decodeSlots + VulkanContext::framesInFlight + 1 + 1 : 0;
     Log::info("Source: " + std::string(toString(config.source)));
     Log::info("Playback policy: " + std::string(toString(playbackPolicy)));
     Log::info("Decoder backend request: " + std::string(toString(config.decoderBackend)));
@@ -255,8 +268,8 @@ int runApplication(AppConfig config) {
     Log::info(std::format("FFmpeg libraries: avformat {}, avcodec {}, avutil {}", versions.avformat, versions.avcodec, versions.avutil));
 
     FFmpegVideoReader reader = config.source == SourceKind::File
-        ? FFmpegVideoReader(config.input, config.decoderBackend)
-        : FFmpegVideoReader(SysDvrPipeInput{config.pipeName}, config.decoderBackend);
+        ? FFmpegVideoReader(config.input, config.decoderBackend, config.decoderPath, externallyRetainedFrames)
+        : FFmpegVideoReader(SysDvrPipeInput{config.pipeName}, config.decoderBackend, config.decoderPath, externallyRetainedFrames);
     const auto info = reader.info();
     if (info.live) {
         Log::info(std::format("Input: {} {}x{} {}, live SysDVR timing, rate N/A, duration N/A, {} / {}, chroma {}",
@@ -270,15 +283,18 @@ int runApplication(AppConfig config) {
     Log::info(std::format("Active decoder backend: {}", toString(info.activeDecoderBackend)));
     Log::info(std::format("Output: {}x{}, {}", config.outputWidth, config.outputHeight, displayName(config.upscale)));
 
-    const bool liveMode = playbackPolicy == PlaybackPolicy::ImmediateLive;
-    const std::size_t decodeSlots = liveMode ? static_cast<std::size_t>(std::max(2, config.liveFrameQueueDepth + 1)) : FramePool::defaultSlotCount;
-    FramePool pool(decodeSlots, info.width, info.height);
+    FramePool pool(decodeSlots, info.width, info.height, !interopMode);
     FrameQueue queue(pool);
-    FramePool displayPool(1, info.width, info.height);
+    FramePool displayPool(1, info.width, info.height, !interopMode);
     auto& displayed = displayPool.at(0);
     Window window(config.outputWidth, config.outputHeight, "NexusStream60", config.fullscreen, config.borderless, config.monitorIndex);
-    VulkanContext context(window, config.validation, config.vsync);
-    VideoPipeline pipeline(context, info.width, info.height, config.outputWidth, config.outputHeight, config.upscale, config.sharpen, config.antiRinging, config.presentation, config.presentationExplicit, config.finalFilter, config.chromaUpscale);
+    const auto requiredAdapterLuid = interopMode ? reader.interopAdapterLuid() : std::nullopt;
+    if (interopMode && !requiredAdapterLuid) throw std::runtime_error("D3D11VA decoder did not expose a valid adapter LUID");
+    // Only the zero-copy path imports the multi-slice decoder array as a layered
+    // Y'CbCr image; the GPU-copy path imports single-layer textures.
+    VulkanContext context(window, config.validation, config.vsync, requiredAdapterLuid,
+                          config.decoderPath == DecoderPath::D3D11VulkanInterop);
+    VideoPipeline pipeline(context, info.width, info.height, config.outputWidth, config.outputHeight, config.upscale, config.sharpen, config.antiRinging, config.presentation, config.presentationExplicit, config.finalFilter, config.chromaUpscale, interopMode);
     if (config.comparisonA && config.comparisonB) pipeline.setComparison(true, *config.comparisonA, *config.comparisonB);
     ImGuiOverlay overlay(window, context, overlayInputPath(config), info, config.outputWidth, config.outputHeight, playbackPolicy, config.latencyProfile, config.liveFrameQueueDepth);
 
@@ -287,6 +303,7 @@ int runApplication(AppConfig config) {
     std::atomic<double> lastDecodeMs{};
     std::atomic<double> lastCopyMs{};
     std::atomic<double> lastWaitMs{};
+    std::atomic<std::uint64_t> lastCopyBytes{};
     std::atomic<std::uint64_t> decodedCount{};
     std::mutex decoderErrorMutex;
     std::exception_ptr decoderError;
@@ -298,14 +315,24 @@ int runApplication(AppConfig config) {
                 const auto waitStart = Clock::now();
                 const auto slot = liveMode ? queue.acquireWriteLatest() : queue.acquireWrite();
                 lastWaitMs.store(std::chrono::duration<double, std::milli>(Clock::now() - waitStart).count(), std::memory_order_relaxed);
-                if (!slot || stop.stop_requested()) break;
+                if (!slot) break;
+                if (stop.stop_requested()) {
+                    queue.cancelWrite(*slot);
+                    break;
+                }
                 if (seekRequested.exchange(false)) {
                     queue.cancelWrite(*slot);
                     reader.seekToBeginning();
                     continue;
                 }
                 DecodeTiming timing{};
-                const auto result = reader.readFrame(pool.at(*slot), timing);
+                ReadFrameResult result{};
+                try {
+                    result = reader.readFrame(pool.at(*slot), timing);
+                } catch (...) {
+                    queue.cancelWrite(*slot);
+                    throw;
+                }
                 if (result == ReadFrameResult::EndOfFile) {
                     queue.cancelWrite(*slot);
                     if (config.loop) {
@@ -322,6 +349,7 @@ int runApplication(AppConfig config) {
                 }
                 lastDecodeMs.store(timing.decodeMs, std::memory_order_relaxed);
                 lastCopyMs.store(timing.copyMs, std::memory_order_relaxed);
+                lastCopyBytes.store(timing.copyBytes, std::memory_order_relaxed);
                 decodedCount.fetch_add(1, std::memory_order_relaxed);
                 queue.commitWrite(*slot);
             }
@@ -342,6 +370,7 @@ int runApplication(AppConfig config) {
     bool step{};
     bool seeking{};
     bool screenshot{};
+    bool automaticCaptureRequested{};
     bool zoomInspector{};
     std::optional<GpuTimings> lastGpuTimings;
     auto statsAt = Clock::now();
@@ -365,6 +394,8 @@ int runApplication(AppConfig config) {
             if (events.stepFrame && paused && !zoomInspector) step = true;
             if (events.seekBeginning) {
                 current.reset();
+                displayed.resetPayload();
+                queue.discardReady();
                 havePreviousPts = false;
                 lastActivePresent.reset();
                 metrics.resetActivePlayback();
@@ -481,10 +512,17 @@ int runApplication(AppConfig config) {
                 window.waitEvents(1.0 / 30.0);
             }
 
-            if (liveMode && current && !acquiredNewFrame) ++metrics.repeatedFrames;
+            if (liveMode && current && !acquiredNewFrame) {
+                ++metrics.repeatedFrames;
+            }
             if (!current) {
                 if (liveMode) window.waitEvents(1.0 / 120.0);
                 continue;
+            }
+            if (config.captureFrame && !automaticCaptureRequested &&
+                current->frameNumber >= *config.captureFrame) {
+                screenshot = true;
+                automaticCaptureRequested = true;
             }
             int framebufferWidth{}, framebufferHeight{};
             if (!window.framebufferExtent(framebufferWidth, framebufferHeight)) {
@@ -498,11 +536,16 @@ int runApplication(AppConfig config) {
             const auto acquired = context.acquireFrame();
             if (!acquired) continue;
             pipeline.completePendingScreenshot(acquired->flightIndex);
+            const auto uploadStart = Clock::now();
             pipeline.prepareFrame(acquired->flightIndex, displayed);
+            const auto uploadEnd = Clock::now();
             pipeline.recordProcessing(acquired->commandBuffer, acquired->flightIndex);
 
             metrics.decodeMs.add(lastDecodeMs.load(std::memory_order_relaxed));
             metrics.planeCopyMs.add(lastCopyMs.load(std::memory_order_relaxed));
+            metrics.cpuCopyBytes = lastCopyBytes.load(std::memory_order_relaxed);
+            metrics.cpuUploadMs.add(interopMode ? 0.0 : std::chrono::duration<double, std::milli>(uploadEnd - uploadStart).count());
+            metrics.cpuUploadBytes = interopMode ? 0 : static_cast<std::uint64_t>(info.width) * static_cast<std::uint64_t>(info.height) * 3 / 2;
             metrics.decoderWaitMs.add(lastWaitMs.load(std::memory_order_relaxed));
             metrics.decodedFrames = decodedCount.load(std::memory_order_relaxed);
             metrics.queueOccupancy = queue.occupancy();
@@ -523,7 +566,7 @@ int runApplication(AppConfig config) {
             pipeline.beginPresent(acquired->commandBuffer, acquired->flightIndex, acquired->imageIndex);
             overlay.record(acquired->commandBuffer);
             pipeline.endPresent(acquired->commandBuffer, acquired->flightIndex);
-            context.submitAndPresent(*acquired);
+            context.submitAndPresent(*acquired, pipeline.timelineWait(acquired->flightIndex));
             ++metrics.presentSubmissions;
 
             const auto now = Clock::now();
@@ -553,6 +596,12 @@ int runApplication(AppConfig config) {
         queue.stop();
         decoder.request_stop();
         if (decoder.joinable()) decoder.join();
+        context.waitIdle();
+        pipeline.releaseInteropFrames();
+        displayed.resetPayload();
+        queue.discardReady();
+        for (auto& slot : pool.slots()) slot.resetPayload();
+        reader.releaseInteropResources();
         throw;
     }
 
@@ -561,6 +610,20 @@ int runApplication(AppConfig config) {
     if (decoder.joinable()) decoder.join();
     context.waitIdle();
     for (std::uint32_t i = 0; i < VulkanContext::framesInFlight; ++i) pipeline.completePendingScreenshot(i);
+    Log::info(std::format(
+        "PERF_SUMMARY path={} samples={} cpu_decode_avg_ms={:.3f} cpu_copy_submit_avg_ms={:.3f} "
+        "cpu_upload_avg_ms={:.3f} gpu_upload_avg_ms={:.3f} gpu_color_avg_ms={:.3f} "
+        "gpu_total_avg_ms={:.3f} active_frame_p50_ms={:.3f} active_frame_p95_ms={:.3f} "
+        "cpu_copy_bytes={} cpu_upload_bytes={}",
+        toString(config.decoderPath), metrics.gpuTotalMs.count(), metrics.decodeMs.average(),
+        metrics.planeCopyMs.average(), metrics.cpuUploadMs.average(), metrics.gpuUploadMs.average(),
+        metrics.gpuColorMs.average(), metrics.gpuTotalMs.average(), metrics.activeFrameTimeMs.percentile(0.50),
+        metrics.activeFrameTimeMs.percentile(0.95), metrics.cpuCopyBytes, metrics.cpuUploadBytes));
+    pipeline.releaseInteropFrames();
+    displayed.resetPayload();
+    queue.discardReady();
+    for (auto& slot : pool.slots()) slot.resetPayload();
+    reader.releaseInteropResources();
     {
         std::lock_guard lock(decoderErrorMutex);
         if (decoderError) std::rethrow_exception(decoderError);

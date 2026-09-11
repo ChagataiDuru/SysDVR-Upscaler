@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 
 option(NS60_BUILD_APP "Build the Vulkan playback application" ON)
 option(NS60_BUILD_TESTS "Build unit tests" ON)
+option(NS60_ENABLE_GPU_TESTS "Run opt-in Windows D3D11/Vulkan GPU integration tests" OFF)
 project(NexusStream60 VERSION 0.1.0 LANGUAGES CXX)
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -43,6 +44,7 @@ if(NS60_BUILD_APP)
     src/decode/FFmpegVideoReader.cpp
     src/decode/SysDvrPipeSource.cpp
     src/platform/Window.cpp
+    src/render/D3D11VulkanInterop.cpp
     src/render/FidelityFxConstants.cpp
     src/render/VulkanContext.cpp
     src/render/VideoPipeline.cpp
@@ -56,7 +58,8 @@ if(NS60_BUILD_APP)
     NS60_DEFAULT_VALIDATION=$<IF:$<BOOL:${NS60_ENABLE_VALIDATION}>,1,0>
     NOMINMAX WIN32_LEAN_AND_MEAN)
   if(WIN32)
-    target_link_libraries(NexusStream60 PRIVATE d3d11 dxgi)
+    target_link_libraries(NexusStream60 PRIVATE d3d11 dxgi d3dcompiler)
+    target_compile_definitions(NexusStream60 PRIVATE VK_USE_PLATFORM_WIN32_KHR)
   endif()
   ns60_enable_warnings(NexusStream60)
   include(CompileShaders)

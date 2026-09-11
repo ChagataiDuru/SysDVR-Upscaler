@@ -35,11 +35,12 @@ using RollingMetric = FixedHistory<double, Capacity>;
 enum class GpuPass : std::size_t { Nearest, Bilinear, Bicubic, Lanczos2, Cas, Easu, Rcas, Count };
 struct GpuTimings { double uploadMs{},colorMs{};std::array<std::optional<double>,static_cast<std::size_t>(GpuPass::Count)> passes{};double reconstructionMs{},postProcessingMs{},presentMs{},totalMs{}; };
 struct Metrics {
- RollingMetric<> decodeMs,planeCopyMs,decoderWaitMs,cpuFrameMs,driftMs,latenessMs,ptsDeltaMs,decodedFps,presentedFps;
+ RollingMetric<> decodeMs,planeCopyMs,cpuUploadMs,decoderWaitMs,cpuFrameMs,driftMs,latenessMs,ptsDeltaMs,decodedFps,presentedFps;
  RollingMetric<> activeFrameTimeMs,presentSubmissionIntervalMs;
  RollingMetric<> gpuUploadMs,gpuColorMs;std::array<RollingMetric<>,static_cast<std::size_t>(GpuPass::Count)> gpuPassMs;
  RollingMetric<> gpuReconstructionMs,gpuPostProcessingMs,gpuPresentMs,gpuTotalMs;
  std::uint64_t decodedFrames{},presentedFrames{},presentSubmissions{},droppedFrames{},repeatedFrames{},lateFrames{},staleDecodedFramesDropped{};std::size_t queueOccupancy{},queueHighWater{};
+ std::uint64_t cpuCopyBytes{},cpuUploadBytes{};
  double activePlaybackSeconds{};
  void resetActivePlayback() noexcept { activeFrameTimeMs.clear(); presentSubmissionIntervalMs.clear(); presentedFps.clear(); activePlaybackSeconds = 0.0; presentedFrames = 0; }
 };

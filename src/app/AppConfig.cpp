@@ -49,9 +49,18 @@ std::optional<DecoderBackend> parseDecoderBackend(std::string_view text) {
     if(text=="auto") return DecoderBackend::Auto;
     return std::nullopt;
 }
+
+bool parseFrameNumber(std::string_view text, std::uint64_t& value) {
+    std::uint64_t parsed{};
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), parsed);
+    if (error != std::errc{} || end != text.data() + text.size()) return false;
+    value = parsed;
+    return true;
+}
 std::optional<DecoderPath> parseDecoderPath(std::string_view text) {
     if(text=="readback") return DecoderPath::Readback;
     if(text=="interop") return DecoderPath::D3D11VulkanInterop;
+    if(text=="interop-copy") return DecoderPath::D3D11VulkanInteropCopy;
     return std::nullopt;
 }
 void applyLatencyProfile(LatencyProfile profile, AppConfig& config) {
@@ -131,10 +140,11 @@ ParseResult parseCommandLine(const std::vector<std::string>& args, bool defaultV
         else if(argument=="--upscaler-pipe-queue-bytes") { const auto* value=requireValue(argument);int parsed{};if(!value||!parseIntInRange(*value,parsed,64*1024,64*1024*1024))return{ParseAction::Run,std::nullopt,"--upscaler-pipe-queue-bytes requires an integer in [65536, 67108864]"};config.bridgePipeQueueBytes=parsed; }
         else if(argument=="--upscaler-pipe-max-age-ms") { const auto* value=requireValue(argument);int parsed{};if(!value||!parseIntInRange(*value,parsed,1,1000))return{ParseAction::Run,std::nullopt,"--upscaler-pipe-max-age-ms requires an integer in [1, 1000]"};config.bridgePipeMaxAgeMs=parsed; }
         else if(argument=="--decoder"||argument=="--decoder-backend") { const auto* value=requireValue(argument);const auto parsed=value?parseDecoderBackend(*value):std::nullopt;if(!parsed)return{ParseAction::Run,std::nullopt,"--decoder requires software, d3d11va, or auto"};config.decoderBackend=*parsed; }
-        else if(argument=="--decoder-path") { const auto* value=requireValue(argument);const auto parsed=value?parseDecoderPath(*value):std::nullopt;if(!parsed)return{ParseAction::Run,std::nullopt,"--decoder-path requires readback or interop"};config.decoderPath=*parsed; }
+        else if(argument=="--decoder-path") { const auto* value=requireValue(argument);const auto parsed=value?parseDecoderPath(*value):std::nullopt;if(!parsed)return{ParseAction::Run,std::nullopt,"--decoder-path requires readback, interop, or interop-copy"};config.decoderPath=*parsed; }
         else if(argument=="--quality-preset") { const auto* value=requireValue(argument); if(!value||!applyQualityPreset(*value,config))return{ParseAction::Run,std::nullopt,"--quality-preset requires balanced, performance, or quality"}; }
         else if(argument=="--width"||argument=="--height") { const auto* value=requireValue(argument);int parsed{};if(!value||!parsePositiveInt(*value,parsed))return{ParseAction::Run,std::nullopt,argument+" requires an integer in [1, 16384]"};(argument=="--width"?config.outputWidth:config.outputHeight)=parsed; }
         else if(argument=="--monitor") { const auto* value=requireValue(argument);int parsed{};if(!value||!parseNonNegativeInt(*value,parsed))return{ParseAction::Run,std::nullopt,"--monitor requires a non-negative integer monitor index"};config.monitorIndex=parsed; }
+        else if(argument=="--capture-frame") { const auto* value=requireValue(argument);std::uint64_t parsed{};if(!value||!parseFrameNumber(*value,parsed))return{ParseAction::Run,std::nullopt,"--capture-frame requires a non-negative frame number"};config.captureFrame=parsed; }
         else if(argument=="--upscale") { const auto* value=requireValue(argument);const auto parsed=value?parseUpscaleMode(*value):std::nullopt;if(!parsed)return{ParseAction::Run,std::nullopt,"Invalid --upscale mode (nearest, bilinear, bicubic, lanczos2, bilinear-cas, lanczos2-cas, fsr1-easu, fsr1-easu-rcas)"};config.upscale=*parsed; }
         else if(argument=="--cas-sharpness"||argument=="--rcas-sharpness") { const auto* value=requireValue(argument);float parsed{};if(!value||!parseUnitFloat(*value,parsed))return{ParseAction::Run,std::nullopt,argument+" requires a finite number in [0.0, 1.0]"};(argument=="--cas-sharpness"?config.sharpen.casSharpness:config.sharpen.rcasSharpness)=parsed; }
         else if(argument=="--anti-ringing"||argument=="--vsync"||argument=="--validation") { const auto* value=requireValue(argument);const auto parsed=value?parseBoolean(*value):std::nullopt;if(!parsed)return{ParseAction::Run,std::nullopt,argument+" requires 'on' or 'off'"};if(argument=="--anti-ringing")config.antiRinging=*parsed;else(argument=="--vsync"?config.vsync:config.validation)=*parsed; }
@@ -151,7 +161,7 @@ ParseResult parseCommandLine(const std::vector<std::string>& args, bool defaultV
     if(config.source!=SourceKind::File&&config.loop)return{ParseAction::Run,std::nullopt,"--loop is only valid with file input"};
     if(config.source==SourceKind::SysDvr&&config.sysdvrBridge.empty())return{ParseAction::Run,std::nullopt,"--source sysdvr requires --sysdvr-bridge <path>"};
     if(config.pipeName.empty())return{ParseAction::Run,std::nullopt,"--pipe-name requires a non-empty pipe name"};
-    if(config.decoderPath==DecoderPath::D3D11VulkanInterop&&config.decoderBackend!=DecoderBackend::D3D11VA)return{ParseAction::Run,std::nullopt,"--decoder-path interop requires --decoder d3d11va"};
+    if(usesD3D11VulkanInterop(config.decoderPath)&&config.decoderBackend!=DecoderBackend::D3D11VA)return{ParseAction::Run,std::nullopt,"--decoder-path interop and interop-copy require --decoder d3d11va"};
     if(config.borderless)config.fullscreen=true;
     return{ParseAction::Run,std::move(config),{}};
 }
@@ -174,7 +184,8 @@ Input options:
   --upscaler-pipe-queue-bytes <n> Managed bridge queue byte cap
   --upscaler-pipe-max-age-ms <n> Managed bridge oldest-payload age cap
   --decoder <backend>         software|d3d11va|auto (default software)
-  --decoder-path <path>       readback|interop (default readback; interop is Phase 3.3 scaffold)
+  --decoder-path <path>       readback|interop|interop-copy (default readback; interop is unavailable on
+                              the tested NVIDIA driver; interop-copy is the recommended D3D11VA fast path)
 
 Diagnostics:
   --list-decoders           List software and FFmpeg hardware decoder inventory
@@ -192,6 +203,7 @@ Output and quality:
   --presentation <mode>       exact|fit|fill|integer (default auto: exact at 1:1, fit otherwise)
   --final-filter <filter>     nearest|bilinear for active Fit/Fill/fallback resampling
   --chroma-upscale <mode>     bilinear|bicubic|lanczos2|edge-aware (default bicubic)
+  --capture-frame <n>         Save the first presented frame number >= n for image validation
   --loop --fullscreen --borderless --drop-late-frames
   --vsync <on|off> --validation <on|off> --log-level <level>
   --help --version

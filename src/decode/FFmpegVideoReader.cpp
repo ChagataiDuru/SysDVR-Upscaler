@@ -14,7 +14,12 @@ extern "C" {
 #include <libavutil/pixdesc.h>
 }
 
+#ifdef _WIN32
+#include <libavutil/hwcontext_d3d11va.h>
+#endif
+
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <format>
@@ -23,6 +28,14 @@ extern "C" {
 #include <string>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#include <d3d11_4.h>
+#include <d3dcompiler.h>
+#include <dxgi1_2.h>
+#include <windows.h>
+#include <wrl/client.h>
+#endif
 
 namespace ns60 {
 namespace {
@@ -124,6 +137,412 @@ std::vector<AVPixelFormat> preferredTransferFormats(AVBufferRef* device) {
     }
     return ordered;
 }
+
+#ifdef _WIN32
+std::string hresultText(HRESULT result) {
+    return std::format("HRESULT 0x{:08x}", static_cast<std::uint32_t>(result));
+}
+
+void closeNativeHandle(std::uintptr_t value) noexcept {
+    if (value) CloseHandle(reinterpret_cast<HANDLE>(value));
+}
+
+PlatformHandle duplicateNativeHandle(HANDLE source, std::string_view label) {
+    HANDLE duplicate{};
+    const BOOL duplicated = DuplicateHandle(GetCurrentProcess(), source, GetCurrentProcess(), &duplicate,
+                                            0, FALSE, DUPLICATE_SAME_ACCESS);
+    if (!duplicated) {
+        throw std::runtime_error(std::format("Failed to duplicate the {} shared handle: Win32 error {}",
+                                             label, GetLastError()));
+    }
+    return {reinterpret_cast<std::uintptr_t>(duplicate), closeNativeHandle};
+}
+
+// Splits one NV12 texture (read through R8/R8G8 plane views) into standalone
+// R8 luma and R8G8 chroma textures. Load/store of UNORM8 values is exact.
+constexpr char planeSplitShader[] = R"(
+Texture2D<float> lumaIn : register(t0);
+Texture2D<float2> chromaIn : register(t1);
+RWTexture2D<unorm float> lumaOut : register(u0);
+RWTexture2D<unorm float2> chromaOut : register(u1);
+cbuffer Parameters : register(b0) { uint width; uint height; uint padding0; uint padding1; };
+
+[numthreads(16, 16, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= width || id.y >= height) return;
+    lumaOut[id.xy] = lumaIn.Load(int3(id.xy, 0));
+    if (id.x < width / 2 && id.y < height / 2) chromaOut[id.xy] = chromaIn.Load(int3(id.xy, 0));
+}
+)";
+
+class D3D11InteropRuntime final {
+public:
+    explicit D3D11InteropRuntime(AVD3D11VADeviceContext& avDevice) : avDevice_(&avDevice) {
+        HRESULT result = avDevice.device->QueryInterface(IID_PPV_ARGS(&device_));
+        if (FAILED(result)) throw std::runtime_error("D3D11/Vulkan interop requires ID3D11Device5: " + hresultText(result));
+        result = avDevice.device_context->QueryInterface(IID_PPV_ARGS(&context_));
+        if (FAILED(result)) throw std::runtime_error("D3D11/Vulkan interop requires ID3D11DeviceContext4: " + hresultText(result));
+        result = device_->CreateFence(0, D3D11_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence_));
+        if (FAILED(result)) throw std::runtime_error("Failed to create the shared D3D11 decode fence: " + hresultText(result));
+        result = fence_->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &fenceHandle_);
+        if (FAILED(result)) throw std::runtime_error("Failed to export the D3D11 decode fence: " + hresultText(result));
+
+        Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
+        result = avDevice.device->QueryInterface(IID_PPV_ARGS(&dxgiDevice));
+        if (FAILED(result)) throw std::runtime_error("Failed to query the D3D11 DXGI device: " + hresultText(result));
+        Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+        result = dxgiDevice->GetAdapter(&adapter);
+        if (FAILED(result)) throw std::runtime_error("Failed to query the D3D11 adapter: " + hresultText(result));
+        DXGI_ADAPTER_DESC adapterDescription{};
+        result = adapter->GetDesc(&adapterDescription);
+        if (FAILED(result)) throw std::runtime_error("Failed to query the D3D11 adapter LUID: " + hresultText(result));
+        luid_.valid = true;
+        std::memcpy(luid_.bytes.data(), &adapterDescription.AdapterLuid, luid_.bytes.size());
+    }
+
+    ~D3D11InteropRuntime() {
+        if (fenceHandle_) CloseHandle(fenceHandle_);
+    }
+
+    [[nodiscard]] AdapterLuid adapterLuid() const noexcept { return luid_; }
+    [[nodiscard]] std::uintptr_t fenceIdentity() const noexcept { return reinterpret_cast<std::uintptr_t>(fence_.Get()); }
+
+    [[nodiscard]] PlatformHandle createFenceHandle() const {
+        return duplicateNativeHandle(fenceHandle_, "D3D11 fence");
+    }
+
+    std::uint64_t signalDecodeReady() {
+        const std::uint64_t value = ++readyValue_;
+        if (avDevice_->lock) avDevice_->lock(avDevice_->lock_ctx);
+        const HRESULT result = context_->Signal(fence_.Get(), value);
+        if (SUCCEEDED(result)) context_->Flush();
+        if (avDevice_->unlock) avDevice_->unlock(avDevice_->lock_ctx);
+        if (FAILED(result)) throw std::runtime_error("Failed to signal the D3D11 decode fence: " + hresultText(result));
+        return value;
+    }
+
+    // Copies one decoder-array slice into a private NV12 texture, splits it into
+    // the luma/chroma UAV targets, and signals the fence on the same immediate
+    // context, so the Vulkan timeline wait covers the copy and the split.
+    std::uint64_t splitAndSignal(ID3D11Texture2D* source, UINT sourceSlice, UINT width, UINT height,
+                                 ID3D11UnorderedAccessView* lumaOut, ID3D11UnorderedAccessView* chromaOut) {
+        ensurePlaneSplitter();
+        ensureStaging(width, height);
+        const std::array<std::uint32_t, 4> parameters{width, height, 0, 0};
+        const std::uint64_t value = ++readyValue_;
+        if (avDevice_->lock) avDevice_->lock(avDevice_->lock_ctx);
+        // R8/R8G8 plane views on a single NV12 Texture2D are the canonical D3D11
+        // case; creating them on the decoder texture array failed E_INVALIDARG.
+        context_->CopySubresourceRegion(staging_.Get(), 0, 0, 0, 0, source, D3D11CalcSubresource(0, sourceSlice, 1), nullptr);
+        context_->UpdateSubresource(splitParameters_.Get(), 0, nullptr, parameters.data(), 0, 0);
+        context_->CSSetShader(splitShader_.Get(), nullptr, 0);
+        ID3D11ShaderResourceView* shaderResources[2]{stagingLuma_.Get(), stagingChroma_.Get()};
+        context_->CSSetShaderResources(0, 2, shaderResources);
+        ID3D11UnorderedAccessView* targets[2]{lumaOut, chromaOut};
+        context_->CSSetUnorderedAccessViews(0, 2, targets, nullptr);
+        ID3D11Buffer* constants = splitParameters_.Get();
+        context_->CSSetConstantBuffers(0, 1, &constants);
+        context_->Dispatch((width + 15) / 16, (height + 15) / 16, 1);
+        // Leave no shared or decoder resource bound to the compute stage.
+        ID3D11ShaderResourceView* noShaderResources[2]{};
+        ID3D11UnorderedAccessView* noTargets[2]{};
+        ID3D11Buffer* noConstants{};
+        context_->CSSetShaderResources(0, 2, noShaderResources);
+        context_->CSSetUnorderedAccessViews(0, 2, noTargets, nullptr);
+        context_->CSSetConstantBuffers(0, 1, &noConstants);
+        context_->CSSetShader(nullptr, nullptr, 0);
+        const HRESULT result = context_->Signal(fence_.Get(), value);
+        if (SUCCEEDED(result)) context_->Flush();
+        if (avDevice_->unlock) avDevice_->unlock(avDevice_->lock_ctx);
+        if (FAILED(result)) throw std::runtime_error("Failed to signal the D3D11 plane-split fence: " + hresultText(result));
+        return value;
+    }
+
+    [[nodiscard]] ID3D11Device* device() const noexcept { return device_.Get(); }
+
+private:
+    void ensurePlaneSplitter() {
+        if (splitShader_) return;
+        Microsoft::WRL::ComPtr<ID3DBlob> bytecode;
+        Microsoft::WRL::ComPtr<ID3DBlob> errors;
+        HRESULT result = D3DCompile(planeSplitShader, sizeof(planeSplitShader) - 1, "ns60_plane_split.hlsl",
+                                    nullptr, nullptr, "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                                    &bytecode, &errors);
+        if (FAILED(result)) {
+            throw std::runtime_error("Failed to compile the D3D11 NV12 plane-split shader: " +
+                (errors ? std::string(static_cast<const char*>(errors->GetBufferPointer()), errors->GetBufferSize())
+                        : hresultText(result)));
+        }
+        result = device_->CreateComputeShader(bytecode->GetBufferPointer(), bytecode->GetBufferSize(), nullptr, &splitShader_);
+        if (FAILED(result)) throw std::runtime_error("Failed to create the D3D11 plane-split shader: " + hresultText(result));
+        D3D11_BUFFER_DESC parameters{};
+        parameters.ByteWidth = 16;
+        parameters.Usage = D3D11_USAGE_DEFAULT;
+        parameters.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        result = device_->CreateBuffer(&parameters, nullptr, &splitParameters_);
+        if (FAILED(result)) throw std::runtime_error("Failed to create the D3D11 plane-split constants: " + hresultText(result));
+    }
+
+    // Private single NV12 texture each decoder slice is copied into, so it can
+    // be read through R8 (luma) and R8G8 (chroma) plane views.
+    void ensureStaging(UINT width, UINT height) {
+        if (staging_ && stagingWidth_ == width && stagingHeight_ == height) return;
+        staging_.Reset();
+        stagingLuma_.Reset();
+        stagingChroma_.Reset();
+        D3D11_TEXTURE2D_DESC description{};
+        description.Width = width;
+        description.Height = height;
+        description.MipLevels = 1;
+        description.ArraySize = 1;
+        description.Format = DXGI_FORMAT_NV12;
+        description.SampleDesc.Count = 1;
+        description.Usage = D3D11_USAGE_DEFAULT;
+        description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        HRESULT result = device_->CreateTexture2D(&description, nullptr, &staging_);
+        if (FAILED(result)) {
+            throw std::runtime_error(std::format("Failed to create the {}x{} NV12 plane-split staging texture: {}",
+                                                 width, height, hresultText(result)));
+        }
+        D3D11_SHADER_RESOURCE_VIEW_DESC view{};
+        view.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        view.Texture2D.MipLevels = 1;
+        view.Format = DXGI_FORMAT_R8_UNORM;
+        result = device_->CreateShaderResourceView(staging_.Get(), &view, &stagingLuma_);
+        if (FAILED(result)) throw std::runtime_error("Failed to create the NV12 luma shader view: " + hresultText(result));
+        view.Format = DXGI_FORMAT_R8G8_UNORM;
+        result = device_->CreateShaderResourceView(staging_.Get(), &view, &stagingChroma_);
+        if (FAILED(result)) throw std::runtime_error("Failed to create the NV12 chroma shader view: " + hresultText(result));
+        stagingWidth_ = width;
+        stagingHeight_ = height;
+    }
+
+    AVD3D11VADeviceContext* avDevice_{};
+    Microsoft::WRL::ComPtr<ID3D11Device5> device_;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext4> context_;
+    Microsoft::WRL::ComPtr<ID3D11Fence> fence_;
+    HANDLE fenceHandle_{};
+    AdapterLuid luid_{};
+    std::uint64_t readyValue_{};
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> splitShader_;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> splitParameters_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> staging_;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> stagingLuma_;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> stagingChroma_;
+    UINT stagingWidth_{};
+    UINT stagingHeight_{};
+};
+
+class D3D11SharedTexturePool final {
+public:
+    D3D11SharedTexturePool(ID3D11Texture2D* texture, std::uint64_t generation)
+        : texture_(texture), generation_(generation) {
+        if (!texture_) throw std::runtime_error("Cannot export a null D3D11VA decoder texture");
+        Microsoft::WRL::ComPtr<IDXGIResource1> resource;
+        HRESULT result = texture_->QueryInterface(IID_PPV_ARGS(&resource));
+        if (FAILED(result)) throw std::runtime_error("Decoder texture does not expose IDXGIResource1: " + hresultText(result));
+        result = resource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+                                              nullptr, &handle_);
+        if (FAILED(result)) throw std::runtime_error("The real D3D11VA decoder texture cannot be exported: " + hresultText(result));
+    }
+
+    ~D3D11SharedTexturePool() {
+        if (handle_) CloseHandle(handle_);
+    }
+
+    [[nodiscard]] ID3D11Texture2D* texture() const noexcept { return texture_.Get(); }
+    [[nodiscard]] std::uint64_t generation() const noexcept { return generation_; }
+    [[nodiscard]] PlatformHandle createTextureHandle() const {
+        return duplicateNativeHandle(handle_, "D3D11 NV12 texture");
+    }
+
+private:
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> texture_;
+    std::uint64_t generation_{};
+    HANDLE handle_{};
+};
+
+class FFmpegD3D11FrameLease final : public D3D11FrameLease {
+public:
+    FFmpegD3D11FrameLease(const AVFrame& source, std::shared_ptr<D3D11InteropRuntime> runtime,
+                          std::shared_ptr<D3D11SharedTexturePool> pool, std::uint64_t readyValue)
+        : frame_(av_frame_clone(&source)), runtime_(std::move(runtime)), pool_(std::move(pool)) {
+        if (!frame_) throw std::bad_alloc();
+        auto* texture = reinterpret_cast<ID3D11Texture2D*>(frame_->data[0]);
+        if (!texture) throw std::runtime_error("FFmpeg returned a null D3D11 decoder texture");
+        if (!pool_ || pool_->texture() != texture) {
+            throw std::runtime_error("FFmpeg returned a D3D11 texture outside the configured shared decoder pool");
+        }
+        D3D11_TEXTURE2D_DESC textureDescription{};
+        texture->GetDesc(&textureDescription);
+        const auto slice = static_cast<std::uintptr_t>(reinterpret_cast<std::uintptr_t>(frame_->data[1]));
+        if (textureDescription.Format != DXGI_FORMAT_NV12) {
+            throw std::runtime_error(std::format("D3D11/Vulkan interop requires an NV12 decoder texture; DXGI format is {}",
+                                                static_cast<unsigned>(textureDescription.Format)));
+        }
+        if (slice >= textureDescription.ArraySize) throw std::runtime_error("FFmpeg returned an invalid D3D11 texture-array slice");
+        description_ = {reinterpret_cast<std::uintptr_t>(texture), pool_->generation(), textureDescription.Width,
+                        textureDescription.Height, textureDescription.ArraySize, static_cast<std::uint32_t>(slice),
+                        readyValue};
+    }
+
+    ~FFmpegD3D11FrameLease() override = default;
+    [[nodiscard]] const D3D11TextureDescription& description() const noexcept override { return description_; }
+    [[nodiscard]] AdapterLuid adapterLuid() const noexcept override { return runtime_->adapterLuid(); }
+    [[nodiscard]] std::uintptr_t fenceIdentity() const noexcept override { return runtime_->fenceIdentity(); }
+    [[nodiscard]] PlatformHandle createFenceHandle() const override { return runtime_->createFenceHandle(); }
+
+    [[nodiscard]] PlatformHandle createTextureHandle() const override {
+        return pool_->createTextureHandle();
+    }
+
+private:
+    std::unique_ptr<AVFrame, FrameDeleter> frame_;
+    std::shared_ptr<D3D11InteropRuntime> runtime_;
+    std::shared_ptr<D3D11SharedTexturePool> pool_;
+    D3D11TextureDescription description_{};
+};
+
+// Standalone shared single-plane textures (R8 luma, R8G8 chroma) that each
+// decoded NV12 slice is split into for --decoder-path interop-copy. On the
+// tested NVIDIA driver, sampling an imported multi-planar NV12 image through
+// R8/R8G8 plane views gave corrupt output (decoder array) or GPU faults and
+// device loss (standalone NV12 textures); plain single-plane imports avoid it.
+// A slot is reused only after every lease referencing it has been released.
+class D3D11CopyRing final {
+public:
+    D3D11CopyRing(ID3D11Device& device, const D3D11_TEXTURE2D_DESC& source, std::size_t count, std::uint64_t generation)
+        : width_(source.Width), height_(source.Height), generation_(generation), slots_(count),
+          inUse_(std::make_unique<std::atomic<bool>[]>(count)) {
+        if (count == 0) throw std::invalid_argument("The D3D11 GPU-copy ring requires at least one texture");
+        if ((width_ & 1U) != 0 || (height_ & 1U) != 0) {
+            throw std::runtime_error("D3D11 GPU-copy interop requires even decoder texture dimensions");
+        }
+        for (auto& slot : slots_) {
+            createPlane(device, DXGI_FORMAT_R8_UNORM, width_, height_, "luma", slot.luma);
+            createPlane(device, DXGI_FORMAT_R8G8_UNORM, width_ / 2, height_ / 2, "chroma", slot.chroma);
+        }
+    }
+
+    ~D3D11CopyRing() {
+        for (const auto& slot : slots_) {
+            if (slot.luma.handle) CloseHandle(slot.luma.handle);
+            if (slot.chroma.handle) CloseHandle(slot.chroma.handle);
+        }
+    }
+    D3D11CopyRing(const D3D11CopyRing&) = delete;
+    D3D11CopyRing& operator=(const D3D11CopyRing&) = delete;
+
+    [[nodiscard]] bool matches(const D3D11_TEXTURE2D_DESC& source) const noexcept {
+        return source.Width == width_ && source.Height == height_;
+    }
+
+    // Called only from the decoder thread; release() may run on the render thread.
+    [[nodiscard]] std::size_t acquire() {
+        for (std::size_t attempt = 0; attempt < slots_.size(); ++attempt) {
+            const std::size_t index = (next_ + attempt) % slots_.size();
+            bool expected = false;
+            if (inUse_[index].compare_exchange_strong(expected, true, std::memory_order_acquire)) {
+                next_ = (index + 1) % slots_.size();
+                return index;
+            }
+        }
+        throw std::runtime_error(std::format("All {} D3D11 GPU-copy textures are still retained", slots_.size()));
+    }
+    void release(std::size_t index) noexcept { inUse_[index].store(false, std::memory_order_release); }
+
+    [[nodiscard]] ID3D11Texture2D* lumaTexture(std::size_t index) const noexcept { return slots_[index].luma.texture.Get(); }
+    [[nodiscard]] ID3D11Texture2D* chromaTexture(std::size_t index) const noexcept { return slots_[index].chroma.texture.Get(); }
+    [[nodiscard]] ID3D11UnorderedAccessView* lumaTarget(std::size_t index) const noexcept { return slots_[index].luma.target.Get(); }
+    [[nodiscard]] ID3D11UnorderedAccessView* chromaTarget(std::size_t index) const noexcept { return slots_[index].chroma.target.Get(); }
+    [[nodiscard]] PlatformHandle createLumaHandle(std::size_t index) const {
+        return duplicateNativeHandle(slots_[index].luma.handle, "D3D11 GPU-copy luma texture");
+    }
+    [[nodiscard]] PlatformHandle createChromaHandle(std::size_t index) const {
+        return duplicateNativeHandle(slots_[index].chroma.handle, "D3D11 GPU-copy chroma texture");
+    }
+    [[nodiscard]] std::uint32_t width() const noexcept { return width_; }
+    [[nodiscard]] std::uint32_t height() const noexcept { return height_; }
+    [[nodiscard]] std::uint64_t generation() const noexcept { return generation_; }
+    [[nodiscard]] std::size_t size() const noexcept { return slots_.size(); }
+
+private:
+    struct Plane {
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+        Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> target;
+        HANDLE handle{};
+    };
+    struct Slot {
+        Plane luma;
+        Plane chroma;
+    };
+
+    static void createPlane(ID3D11Device& device, DXGI_FORMAT format, UINT width, UINT height,
+                            const char* label, Plane& plane) {
+        D3D11_TEXTURE2D_DESC description{};
+        description.Width = width;
+        description.Height = height;
+        description.MipLevels = 1;
+        description.ArraySize = 1;
+        description.Format = format;
+        description.SampleDesc.Count = 1;
+        description.Usage = D3D11_USAGE_DEFAULT;
+        description.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+        description.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+        HRESULT result = device.CreateTexture2D(&description, nullptr, &plane.texture);
+        if (FAILED(result)) {
+            throw std::runtime_error(std::format("Failed to create the shared {}x{} GPU-copy {} texture: {}",
+                                                 width, height, label, hresultText(result)));
+        }
+        result = device.CreateUnorderedAccessView(plane.texture.Get(), nullptr, &plane.target);
+        if (FAILED(result)) {
+            throw std::runtime_error(std::format("Failed to create the GPU-copy {} UAV: {}", label, hresultText(result)));
+        }
+        Microsoft::WRL::ComPtr<IDXGIResource1> resource;
+        result = plane.texture.As(&resource);
+        if (FAILED(result)) throw std::runtime_error("GPU-copy texture does not expose IDXGIResource1: " + hresultText(result));
+        result = resource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+                                              nullptr, &plane.handle);
+        if (FAILED(result)) {
+            throw std::runtime_error(std::format("Failed to export the GPU-copy {} texture: {}", label, hresultText(result)));
+        }
+    }
+
+    std::uint32_t width_{};
+    std::uint32_t height_{};
+    std::uint64_t generation_{};
+    std::vector<Slot> slots_;
+    std::unique_ptr<std::atomic<bool>[]> inUse_;
+    std::size_t next_{};
+};
+
+class D3D11CopyFrameLease final : public D3D11FrameLease {
+public:
+    D3D11CopyFrameLease(std::shared_ptr<D3D11InteropRuntime> runtime, std::shared_ptr<D3D11CopyRing> ring,
+                        std::size_t slot, std::uint64_t readyValue)
+        : runtime_(std::move(runtime)), ring_(std::move(ring)), slot_(slot) {
+        description_ = {reinterpret_cast<std::uintptr_t>(ring_->lumaTexture(slot_)), ring_->generation(),
+                        ring_->width(), ring_->height(), 1, 0, readyValue,
+                        reinterpret_cast<std::uintptr_t>(ring_->chromaTexture(slot_))};
+    }
+    ~D3D11CopyFrameLease() override { ring_->release(slot_); }
+    D3D11CopyFrameLease(const D3D11CopyFrameLease&) = delete;
+    D3D11CopyFrameLease& operator=(const D3D11CopyFrameLease&) = delete;
+
+    [[nodiscard]] const D3D11TextureDescription& description() const noexcept override { return description_; }
+    [[nodiscard]] AdapterLuid adapterLuid() const noexcept override { return runtime_->adapterLuid(); }
+    [[nodiscard]] std::uintptr_t fenceIdentity() const noexcept override { return runtime_->fenceIdentity(); }
+    [[nodiscard]] PlatformHandle createFenceHandle() const override { return runtime_->createFenceHandle(); }
+    [[nodiscard]] PlatformHandle createTextureHandle() const override { return ring_->createLumaHandle(slot_); }
+    [[nodiscard]] PlatformHandle createChromaTextureHandle() const override { return ring_->createChromaHandle(slot_); }
+
+private:
+    std::shared_ptr<D3D11InteropRuntime> runtime_;
+    std::shared_ptr<D3D11CopyRing> ring_;
+    std::size_t slot_{};
+    D3D11TextureDescription description_{};
+};
+#endif
 } // namespace
 
 struct FFmpegVideoReader::Impl {
@@ -141,6 +560,15 @@ struct FFmpegVideoReader::Impl {
     std::optional<AVPixelFormat> successfulTransferFormat;
     DecoderBackend requestedBackend{DecoderBackend::Software};
     DecoderBackend activeBackend{DecoderBackend::Software};
+    DecoderPath requestedPath{DecoderPath::Readback};
+    std::size_t externallyRetainedFrames{};
+    std::uint64_t poolGeneration{};
+    std::string hardwareFormatError;
+#ifdef _WIN32
+    std::shared_ptr<D3D11InteropRuntime> interopRuntime;
+    std::shared_ptr<D3D11SharedTexturePool> interopPool;
+    std::shared_ptr<D3D11CopyRing> copyRing;
+#endif
     AVStream* stream{};
     int streamIndex{-1};
     VideoStreamInfo streamInfo;
@@ -152,18 +580,51 @@ struct FFmpegVideoReader::Impl {
     std::int64_t lastPts{AV_NOPTS_VALUE};
     double fallbackPts{};
 
-    explicit Impl(const std::filesystem::path& path, DecoderBackend backend) : requestedBackend(backend) {
+    explicit Impl(const std::filesystem::path& path, DecoderBackend backend, DecoderPath pathMode,
+                  std::size_t retainedFrames)
+        : requestedBackend(backend), requestedPath(pathMode), externallyRetainedFrames(retainedFrames) {
+        validateRequestedPath();
         const auto utf8 = path.u8string();
         const std::string filename(utf8.begin(), utf8.end());
         openFile(filename);
     }
 
-    explicit Impl(SysDvrPipeInput input, DecoderBackend backend) : requestedBackend(backend) {
+    explicit Impl(SysDvrPipeInput input, DecoderBackend backend, DecoderPath pathMode,
+                  std::size_t retainedFrames)
+        : requestedBackend(backend), requestedPath(pathMode), externallyRetainedFrames(retainedFrames) {
+        validateRequestedPath();
         if (input.pipeName.empty()) throw std::invalid_argument("SysDVR pipe input requires a pipe name");
         seekable = false;
         liveInput = true;
         allowMetadataDefaults = true;
         openPipe(std::move(input.pipeName));
+    }
+
+    void validateRequestedPath() const {
+        if (!usesD3D11VulkanInterop(requestedPath)) return;
+        if (requestedBackend != DecoderBackend::D3D11VA) {
+            throw std::invalid_argument("D3D11/Vulkan interop requires an explicit D3D11VA decoder");
+        }
+        if (externallyRetainedFrames == 0) {
+            throw std::invalid_argument("D3D11/Vulkan interop requires a non-zero retained-frame capacity");
+        }
+#ifndef _WIN32
+        throw std::runtime_error("D3D11/Vulkan interop is only available on Windows");
+#endif
+    }
+
+    void releaseInterop() noexcept {
+        if (!usesD3D11VulkanInterop(requestedPath)) return;
+        if (frame) av_frame_unref(frame.get());
+        if (transferFrame) av_frame_unref(transferFrame.get());
+        if (packet) av_packet_unref(packet.get());
+        codec.reset();
+#ifdef _WIN32
+        copyRing.reset();
+        interopPool.reset();
+        interopRuntime.reset();
+#endif
+        hardwareDevice.reset();
     }
 
     ~Impl() {
@@ -188,13 +649,99 @@ struct FFmpegVideoReader::Impl {
     }
 
     static AVPixelFormat getHardwareFormat(AVCodecContext* context, const AVPixelFormat* formats) noexcept {
-        const auto* self = static_cast<const Impl*>(context->opaque);
+        auto* self = static_cast<Impl*>(context->opaque);
         if (self) {
             for (const AVPixelFormat* format = formats; *format != AV_PIX_FMT_NONE; ++format) {
-                if (*format == self->hardwarePixelFormat) return *format;
+                if (*format == self->hardwarePixelFormat) {
+                    if (self->requestedPath != DecoderPath::D3D11VulkanInterop) return *format;
+                    try {
+                        self->configureInteropFrames(*context);
+                        return *format;
+                    } catch (const std::exception& error) {
+                        self->hardwareFormatError = error.what();
+                        return AV_PIX_FMT_NONE;
+                    } catch (...) {
+                        self->hardwareFormatError = "Unknown failure while configuring the D3D11VA interop surface pool";
+                        return AV_PIX_FMT_NONE;
+                    }
+                }
             }
         }
         return formats && *formats != AV_PIX_FMT_NONE ? *formats : AV_PIX_FMT_NONE;
+    }
+
+    void configureInteropFrames(AVCodecContext& context) {
+#ifdef _WIN32
+        AVBufferRef* rawFrames{};
+        const int parametersResult = avcodec_get_hw_frames_parameters(
+            &context, hardwareDevice.get(), hardwarePixelFormat, &rawFrames);
+        if (parametersResult < 0) {
+            throw std::runtime_error("Failed to obtain D3D11VA decoder frame parameters in get_format: " +
+                                     ffmpegError(parametersResult));
+        }
+        BufferRefPtr frames(rawFrames);
+        auto* frameContext = reinterpret_cast<AVHWFramesContext*>(frames->data);
+        auto* d3dFrames = static_cast<AVD3D11VAFramesContext*>(frameContext->hwctx);
+        frameContext->sw_format = AV_PIX_FMT_NV12;
+        const auto requestedPoolSize = d3d11InteropPoolSize(
+            static_cast<std::size_t>(std::max(frameContext->initial_pool_size, 0)), externallyRetainedFrames,
+            D3D11_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION);
+        frameContext->initial_pool_size = static_cast<int>(requestedPoolSize);
+        d3dFrames->BindFlags = D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE;
+        d3dFrames->MiscFlags = D3D11_RESOURCE_MISC_SHARED |
+                               D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+
+        D3D11_TEXTURE2D_DESC requestedDescription{};
+        requestedDescription.Width = static_cast<UINT>(frameContext->width);
+        requestedDescription.Height = static_cast<UINT>(frameContext->height);
+        requestedDescription.MipLevels = 1;
+        requestedDescription.ArraySize = static_cast<UINT>(requestedPoolSize);
+        requestedDescription.Format = DXGI_FORMAT_NV12;
+        requestedDescription.SampleDesc.Count = 1;
+        requestedDescription.Usage = D3D11_USAGE_DEFAULT;
+        requestedDescription.BindFlags = d3dFrames->BindFlags;
+        requestedDescription.MiscFlags = d3dFrames->MiscFlags;
+        auto* deviceContext = reinterpret_cast<AVHWDeviceContext*>(hardwareDevice->data);
+        auto* d3d11Device = static_cast<AVD3D11VADeviceContext*>(deviceContext->hwctx);
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> validationTexture;
+        const HRESULT validationResult = d3d11Device->device->CreateTexture2D(
+            &requestedDescription, nullptr, &validationTexture);
+        if (FAILED(validationResult)) {
+            throw std::runtime_error(std::format(
+                "D3D11 rejected the required shared NV12 decoder array {}x{}, {} slices "
+                "(bind 0x{:x}, misc 0x{:x}): {}; strict interop cannot fall back to a copy",
+                requestedDescription.Width, requestedDescription.Height, requestedDescription.ArraySize,
+                requestedDescription.BindFlags, requestedDescription.MiscFlags, hresultText(validationResult)));
+        }
+        validationTexture.Reset();
+
+        const int initResult = av_hwframe_ctx_init(frames.get());
+        if (initResult < 0) {
+            throw std::runtime_error("Failed to initialize the shared NV12 D3D11VA surface pool: " + ffmpegError(initResult));
+        }
+        if (!d3dFrames->texture) throw std::runtime_error("FFmpeg did not create the required D3D11VA array texture");
+        D3D11_TEXTURE2D_DESC description{};
+        d3dFrames->texture->GetDesc(&description);
+        if (description.Format != DXGI_FORMAT_NV12 || description.ArraySize != requestedPoolSize ||
+            (description.BindFlags & (D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE)) !=
+                (D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE) ||
+            (description.MiscFlags & D3D11_RESOURCE_MISC_SHARED) == 0 ||
+            (description.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE) == 0) {
+            throw std::runtime_error(std::format(
+                "D3D11VA returned an incompatible shared surface pool (format {}, array {}, bind 0x{:x}, misc 0x{:x})",
+                static_cast<unsigned>(description.Format), description.ArraySize, description.BindFlags, description.MiscFlags));
+        }
+        ++poolGeneration;
+        interopPool = std::make_shared<D3D11SharedTexturePool>(d3dFrames->texture, poolGeneration);
+        context.hw_frames_ctx = frames.release();
+        Log::info(std::format(
+            "D3D11VA interop pool generation {}: FFmpeg recommendation + retained capacity = {} surfaces "
+            "(bind 0x{:x}, misc 0x{:x})",
+            poolGeneration, requestedPoolSize, description.BindFlags, description.MiscFlags));
+#else
+        (void)context;
+        throw std::runtime_error("D3D11/Vulkan interop is only available on Windows");
+#endif
     }
 
     void openFile(const std::string& filename) {
@@ -247,7 +794,10 @@ struct FFmpegVideoReader::Impl {
         if (!codec || !packet || !frame || !transferFrame) throw std::bad_alloc();
         const int result = avcodec_parameters_to_context(codec.get(), stream->codecpar);
         if (result < 0) throw std::runtime_error("Failed to copy H.264 decoder parameters: " + ffmpegError(result));
-        codec->thread_count = 0;
+        // FFmpeg's frame-thread clones can invoke get_format concurrently and
+        // create independent hardware pools. Strict interop needs one shared
+        // decoder array whose generation and fence are tracked deterministically.
+        codec->thread_count = usesD3D11VulkanInterop(requestedPath) ? 1 : 0;
     }
 
     void resetHardwareState() {
@@ -260,6 +810,12 @@ struct FFmpegVideoReader::Impl {
         hardwarePixelFormat = AV_PIX_FMT_NONE;
         transferFormats.clear();
         successfulTransferFormat.reset();
+        hardwareFormatError.clear();
+#ifdef _WIN32
+        interopPool.reset();
+        copyRing.reset();
+        interopRuntime.reset();
+#endif
         activeBackend = DecoderBackend::Software;
     }
 
@@ -280,8 +836,17 @@ struct FFmpegVideoReader::Impl {
         const int result = av_hwdevice_ctx_create(&rawDevice, AV_HWDEVICE_TYPE_D3D11VA, nullptr, nullptr, 0);
         if (result < 0) throw std::runtime_error("Failed to create FFmpeg D3D11VA device: " + ffmpegError(result));
         hardwareDevice.reset(rawDevice);
-        transferFormats = preferredTransferFormats(hardwareDevice.get());
-        if (transferFormats.empty()) throw std::runtime_error("D3D11VA device exposes no CPU transfer format usable by the owned YUV420 frame path");
+        if (requestedPath == DecoderPath::Readback) {
+            transferFormats = preferredTransferFormats(hardwareDevice.get());
+            if (transferFormats.empty()) throw std::runtime_error("D3D11VA device exposes no CPU transfer format usable by the owned YUV420 frame path");
+        }
+#ifdef _WIN32
+        if (usesD3D11VulkanInterop(requestedPath)) {
+            auto* deviceContext = reinterpret_cast<AVHWDeviceContext*>(hardwareDevice->data);
+            auto* d3d11Context = static_cast<AVD3D11VADeviceContext*>(deviceContext->hwctx);
+            interopRuntime = std::make_shared<D3D11InteropRuntime>(*d3d11Context);
+        }
+#endif
 
         codec->hw_device_ctx = av_buffer_ref(hardwareDevice.get());
         if (!codec->hw_device_ctx) throw std::bad_alloc();
@@ -325,6 +890,8 @@ struct FFmpegVideoReader::Impl {
 
     std::string advertisedPixelFormatName(AVPixelFormat containerPixelFormat) const {
         if (activeBackend == DecoderBackend::D3D11VA) {
+            if (requestedPath == DecoderPath::D3D11VulkanInterop) return "d3d11 / D3D11 NV12";
+            if (requestedPath == DecoderPath::D3D11VulkanInteropCopy) return "d3d11 / D3D11 NV12 (GPU copy)";
             const AVPixelFormat transferFormat = successfulTransferFormat.value_or(transferFormats.empty() ? AV_PIX_FMT_NONE : transferFormats.front());
             return pixelFormatName(hardwarePixelFormat) + " -> CPU " + pixelFormatName(transferFormat);
         }
@@ -367,6 +934,7 @@ struct FFmpegVideoReader::Impl {
         streamInfo.pixelFormatName = advertisedPixelFormatName(pixelFormat);
         streamInfo.requestedDecoderBackend = requestedBackend;
         streamInfo.activeDecoderBackend = activeBackend;
+        streamInfo.activeDecoderPath = requestedPath;
         streamInfo.width = codec->width;
         streamInfo.height = codec->height;
         streamInfo.declaredFrameRate = rational(stream->r_frame_rate);
@@ -416,8 +984,8 @@ struct FFmpegVideoReader::Impl {
         }
 
         int lastError = AVERROR(EINVAL);
-        for (const AVPixelFormat format : transferFormats) {
-            lastError = tryTransfer(format);
+        for (const AVPixelFormat transferFormat : transferFormats) {
+            lastError = tryTransfer(transferFormat);
             if (lastError >= 0) return transferFrame.get();
         }
         throw std::runtime_error("D3D11VA frame transfer failed for all CPU formats: " + ffmpegError(lastError));
@@ -425,7 +993,10 @@ struct FFmpegVideoReader::Impl {
 
     AVFrame* materializeFrame() {
         const auto decodedFormat = static_cast<AVPixelFormat>(frame->format);
-        if (activeBackend == DecoderBackend::D3D11VA && decodedFormat == hardwarePixelFormat) return transferHardwareFrame();
+        if (activeBackend == DecoderBackend::D3D11VA && decodedFormat == hardwarePixelFormat) {
+            if (usesD3D11VulkanInterop(requestedPath)) return frame.get();
+            return transferHardwareFrame();
+        }
         if (activeBackend == DecoderBackend::D3D11VA && requestedBackend == DecoderBackend::D3D11VA) {
             throw std::runtime_error("D3D11VA was requested but FFmpeg returned a non-hardware frame format '" + pixelFormatName(decodedFormat) + "'");
         }
@@ -437,6 +1008,36 @@ struct FFmpegVideoReader::Impl {
         return frame.get();
     }
 
+#ifdef _WIN32
+    std::shared_ptr<D3D11FrameLease> copyDecodedFrame(const AVFrame& source) {
+        auto* texture = reinterpret_cast<ID3D11Texture2D*>(source.data[0]);
+        if (!texture) throw std::runtime_error("FFmpeg returned a null D3D11 decoder texture");
+        D3D11_TEXTURE2D_DESC description{};
+        texture->GetDesc(&description);
+        if (description.Format != DXGI_FORMAT_NV12) {
+            throw std::runtime_error(std::format("D3D11/Vulkan GPU-copy interop requires an NV12 decoder texture; DXGI format is {}",
+                                                 static_cast<unsigned>(description.Format)));
+        }
+        const auto slice = static_cast<UINT>(reinterpret_cast<std::uintptr_t>(source.data[1]));
+        if (slice >= description.ArraySize) throw std::runtime_error("FFmpeg returned an invalid D3D11 texture-array slice");
+        if (!copyRing || !copyRing->matches(description)) {
+            copyRing = std::make_shared<D3D11CopyRing>(*interopRuntime->device(), description,
+                                                       externallyRetainedFrames, ++poolGeneration);
+            Log::info(std::format("D3D11 GPU-copy ring generation {}: {} shared {}x{} R8/R8G8 plane texture pairs",
+                                  poolGeneration, copyRing->size(), copyRing->width(), copyRing->height()));
+        }
+        const std::size_t slot = copyRing->acquire();
+        try {
+            const auto readyValue = interopRuntime->splitAndSignal(texture, slice, copyRing->width(), copyRing->height(),
+                                                                   copyRing->lumaTarget(slot), copyRing->chromaTarget(slot));
+            return std::make_shared<D3D11CopyFrameLease>(interopRuntime, copyRing, slot, readyValue);
+        } catch (...) {
+            copyRing->release(slot);
+            throw;
+        }
+    }
+#endif
+
     ReadFrameResult read(Yuv420FrameSlot& destination, DecodeTiming& timing) {
         const auto operationStart = Clock::now();
         while (true) {
@@ -444,11 +1045,15 @@ struct FFmpegVideoReader::Impl {
             if (result == 0) {
                 AVFrame* outputFrame = materializeFrame();
                 const auto outputFormat = static_cast<AVPixelFormat>(outputFrame->format);
-                if (!isOwnedSlotCompatible(outputFormat)) {
+                const bool interopFrame = usesD3D11VulkanInterop(requestedPath);
+                if (interopFrame && outputFormat != hardwarePixelFormat) {
+                    throw std::runtime_error("D3D11/Vulkan interop decoder output changed away from AV_PIX_FMT_D3D11");
+                }
+                if (!interopFrame && !isOwnedSlotCompatible(outputFormat)) {
                     throw std::runtime_error("Decoder output changed to unsupported format '" + pixelFormatName(outputFormat) + "'");
                 }
                 if (outputFrame->width != streamInfo.width || outputFrame->height != streamInfo.height) {
-                    throw std::runtime_error(std::format("Midstream resolution change {}x{} to {}x{} is unsupported in Phase 1",
+                    throw std::runtime_error(std::format("Midstream resolution change {}x{} to {}x{} is unsupported",
                         streamInfo.width, streamInfo.height, outputFrame->width, outputFrame->height));
                 }
                 const auto decodedAt = Clock::now();
@@ -472,9 +1077,32 @@ struct FFmpegVideoReader::Impl {
                     fallbackPts = ptsSeconds + duration;
                 }
 
+                destination.resetPayload();
                 const auto copyStart = Clock::now();
-                if (isPlanar420(outputFormat)) copyPlanar420Frame(destination, *outputFrame);
-                else copyNv12Frame(destination, *outputFrame);
+                if (interopFrame) {
+#ifdef _WIN32
+                    if (!interopRuntime) {
+                        throw std::runtime_error("D3D11/Vulkan interop frame arrived without an initialized D3D11 runtime");
+                    }
+                    destination.storage = DecodedFrameStorage::D3D11Nv12;
+                    if (requestedPath == DecoderPath::D3D11VulkanInteropCopy) {
+                        destination.d3d11Lease = copyDecodedFrame(*outputFrame);
+                    } else {
+                        if (poolGeneration == 0) {
+                            throw std::runtime_error("D3D11/Vulkan interop frame arrived without an initialized shared surface pool");
+                        }
+                        const auto readyValue = interopRuntime->signalDecodeReady();
+                        destination.d3d11Lease = std::make_shared<FFmpegD3D11FrameLease>(
+                            *outputFrame, interopRuntime, interopPool, readyValue);
+                    }
+#else
+                    throw std::runtime_error("D3D11/Vulkan interop is only available on Windows");
+#endif
+                } else if (isPlanar420(outputFormat)) {
+                    copyPlanar420Frame(destination, *outputFrame);
+                } else {
+                    copyNv12Frame(destination, *outputFrame);
+                }
                 const auto copyEnd = Clock::now();
                 destination.metadata = {outputFrame->width, outputFrame->height, pts, ptsSeconds, duration, frameNumber++,
                     (frame->flags & AV_FRAME_FLAG_KEY) != 0,
@@ -483,13 +1111,19 @@ struct FFmpegVideoReader::Impl {
                      mapMatrix(bestMatrix(outputFrame->colorspace, codec->colorspace), allowMetadataDefaults)}};
                 destination.metadata.storage = destination.storage;
                 timing.decodeMs = std::chrono::duration<double, std::milli>(decodedAt - operationStart).count();
-                timing.copyMs = std::chrono::duration<double, std::milli>(copyEnd - copyStart).count();
+                timing.copyMs = requestedPath == DecoderPath::D3D11VulkanInterop
+                    ? 0.0 : std::chrono::duration<double, std::milli>(copyEnd - copyStart).count();
+                timing.copyBytes = interopFrame ? 0 : static_cast<std::uint64_t>(outputFrame->width) *
+                    static_cast<std::uint64_t>(outputFrame->height) * 3 / 2;
                 av_frame_unref(transferFrame.get());
                 av_frame_unref(frame.get());
                 return ReadFrameResult::Frame;
             }
             if (result == AVERROR_EOF) return ReadFrameResult::EndOfFile;
-            if (result != AVERROR(EAGAIN)) throw std::runtime_error("H.264 decoder receive failed: " + ffmpegError(result));
+            if (result != AVERROR(EAGAIN)) {
+                if (!hardwareFormatError.empty()) throw std::runtime_error("D3D11VA format setup failed: " + hardwareFormatError);
+                throw std::runtime_error("H.264 decoder receive failed: " + ffmpegError(result));
+            }
             if (draining) throw std::runtime_error("H.264 decoder requested input while draining at end of stream");
 
             result = av_read_frame(format.get(), packet.get());
@@ -506,7 +1140,12 @@ struct FFmpegVideoReader::Impl {
             if (packet->stream_index == streamIndex) {
                 result = avcodec_send_packet(codec.get(), packet.get());
                 av_packet_unref(packet.get());
-                if (result < 0) throw std::runtime_error("H.264 decoder rejected a packet: " + ffmpegError(result));
+                if (result < 0) {
+                    if (!hardwareFormatError.empty()) {
+                        throw std::runtime_error("D3D11VA format setup failed: " + hardwareFormatError);
+                    }
+                    throw std::runtime_error("H.264 decoder rejected a packet: " + ffmpegError(result));
+                }
             } else {
                 av_packet_unref(packet.get());
             }
@@ -533,12 +1172,23 @@ struct FFmpegVideoReader::Impl {
     }
 };
 
-FFmpegVideoReader::FFmpegVideoReader(const std::filesystem::path& path, DecoderBackend backend) : impl_(std::make_unique<Impl>(path, backend)) {}
-FFmpegVideoReader::FFmpegVideoReader(SysDvrPipeInput input, DecoderBackend backend) : impl_(std::make_unique<Impl>(std::move(input), backend)) {}
+FFmpegVideoReader::FFmpegVideoReader(const std::filesystem::path& path, DecoderBackend backend,
+                                     DecoderPath pathMode, std::size_t externallyRetainedFrames)
+    : impl_(std::make_unique<Impl>(path, backend, pathMode, externallyRetainedFrames)) {}
+FFmpegVideoReader::FFmpegVideoReader(SysDvrPipeInput input, DecoderBackend backend,
+                                     DecoderPath pathMode, std::size_t externallyRetainedFrames)
+    : impl_(std::make_unique<Impl>(std::move(input), backend, pathMode, externallyRetainedFrames)) {}
 FFmpegVideoReader::~FFmpegVideoReader() = default;
 FFmpegVideoReader::FFmpegVideoReader(FFmpegVideoReader&&) noexcept = default;
 FFmpegVideoReader& FFmpegVideoReader::operator=(FFmpegVideoReader&&) noexcept = default;
 const VideoStreamInfo& FFmpegVideoReader::info() const noexcept { return impl_->streamInfo; }
+std::optional<AdapterLuid> FFmpegVideoReader::interopAdapterLuid() const noexcept {
+#ifdef _WIN32
+    if (impl_->interopRuntime) return impl_->interopRuntime->adapterLuid();
+#endif
+    return std::nullopt;
+}
+void FFmpegVideoReader::releaseInteropResources() noexcept { impl_->releaseInterop(); }
 ReadFrameResult FFmpegVideoReader::readFrame(Yuv420FrameSlot& destination, DecodeTiming& timing) { return impl_->read(destination, timing); }
 void FFmpegVideoReader::seekToBeginning() { impl_->seek(); }
 

@@ -8,6 +8,7 @@
 #include <format>
 #include <limits>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 
 namespace ns60 {
@@ -43,6 +44,49 @@ bool hasDeviceExtension(VkPhysicalDevice device, const char* name) {
     return std::any_of(extensions.begin(), extensions.end(), [name](const auto& value) { return std::strcmp(value.extensionName, name) == 0; });
 }
 
+AdapterLuid physicalDeviceLuid(VkPhysicalDevice device) {
+    VkPhysicalDeviceIDProperties ids{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+    VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    properties.pNext = &ids;
+    vkGetPhysicalDeviceProperties2(device, &properties);
+    AdapterLuid result{};
+    if (ids.deviceLUIDValid == VK_TRUE) {
+        result.valid = true;
+        std::memcpy(result.bytes.data(), ids.deviceLUID, result.bytes.size());
+    }
+    return result;
+}
+
+bool supportsD3D11FenceImport(VkPhysicalDevice device) {
+    VkPhysicalDeviceExternalSemaphoreInfo info{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO};
+    info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D11_FENCE_BIT;
+    VkExternalSemaphoreProperties properties{VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES};
+    vkGetPhysicalDeviceExternalSemaphoreProperties(device, &info, &properties);
+    return (properties.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT) != 0;
+}
+
+bool supportsTimelineSemaphores(VkPhysicalDevice device) {
+    VkPhysicalDeviceTimelineSemaphoreFeatures timeline{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+    VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    features.pNext = &timeline;
+    vkGetPhysicalDeviceFeatures2(device, &features);
+    return timeline.timelineSemaphore == VK_TRUE;
+}
+
+// The D3D11VA decoder surface pool is one NV12 texture array. A multi-planar
+// Vulkan image may only have more than one array layer when ycbcrImageArrays
+// is enabled; without it the layered plane layout is undefined.
+bool supportsYcbcrImageArrays(VkPhysicalDevice device) {
+    if (!hasDeviceExtension(device, VK_EXT_YCBCR_IMAGE_ARRAYS_EXTENSION_NAME)) return false;
+    VkPhysicalDeviceYcbcrImageArraysFeaturesEXT arrays{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_YCBCR_IMAGE_ARRAYS_FEATURES_EXT};
+    VkPhysicalDeviceSamplerYcbcrConversionFeatures conversion{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES};
+    conversion.pNext = &arrays;
+    VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    features.pNext = &conversion;
+    vkGetPhysicalDeviceFeatures2(device, &features);
+    return conversion.samplerYcbcrConversion == VK_TRUE && arrays.ycbcrImageArrays == VK_TRUE;
+}
+
 std::string apiVersion(std::uint32_t value) {
     return std::format("{}.{}.{}", VK_VERSION_MAJOR(value), VK_VERSION_MINOR(value), VK_VERSION_PATCH(value));
 }
@@ -58,8 +102,10 @@ const char* presentModeText(VkPresentModeKHR mode) {
 }
 } // namespace
 
-VulkanContext::VulkanContext(Window& window, bool validation, bool vsync)
-    : window_(window), validationEnabled_(validation), vsync_(vsync) {
+VulkanContext::VulkanContext(Window& window, bool validation, bool vsync,
+                             std::optional<AdapterLuid> requiredAdapterLuid, bool requireYcbcrImageArrays)
+    : window_(window), validationEnabled_(validation), requireYcbcrImageArrays_(requireYcbcrImageArrays),
+      vsync_(vsync), requiredAdapterLuid_(requiredAdapterLuid) {
     createInstance();
     surface_ = window_.createSurface(instance_);
     selectPhysicalDevice();
@@ -74,7 +120,6 @@ VulkanContext::~VulkanContext() {
     if (queryPool_) vkDestroyQueryPool(device_, queryPool_, nullptr);
     for (const auto& flight : flights_) {
         if (flight.fence) vkDestroyFence(device_, flight.fence, nullptr);
-        if (flight.renderComplete) vkDestroySemaphore(device_, flight.renderComplete, nullptr);
         if (flight.imageAvailable) vkDestroySemaphore(device_, flight.imageAvailable, nullptr);
     }
     if (commandPool_) vkDestroyCommandPool(device_, commandPool_, nullptr);
@@ -135,11 +180,52 @@ void VulkanContext::selectPhysicalDevice() {
     vkCheck(vkEnumeratePhysicalDevices(instance_, &count, devices.data()), "vkEnumeratePhysicalDevices");
 
     int bestScore = -1;
+    bool matchingLuidSeen = false;
+    std::string interopRejection;
     for (const auto device : devices) {
         VkPhysicalDeviceProperties properties{};
         vkGetPhysicalDeviceProperties(device, &properties);
         if (properties.apiVersion < VK_API_VERSION_1_2 || !properties.limits.timestampComputeAndGraphics) continue;
         if (!hasDeviceExtension(device, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) continue;
+        if (requiredAdapterLuid_) {
+            const auto luid = physicalDeviceLuid(device);
+            if (!adapterLuidsMatch(*requiredAdapterLuid_, luid)) continue;
+            matchingLuidSeen = true;
+#ifdef _WIN32
+            if (!hasDeviceExtension(device, "VK_KHR_external_memory_win32")) {
+                interopRejection = "matching Vulkan adapter lacks VK_KHR_external_memory_win32";
+                continue;
+            }
+            if (!hasDeviceExtension(device, "VK_KHR_external_semaphore_win32")) {
+                interopRejection = "matching Vulkan adapter lacks VK_KHR_external_semaphore_win32";
+                continue;
+            }
+#else
+            interopRejection = "D3D11/Vulkan interop is only available on Windows";
+            continue;
+#endif
+            if (!supportsTimelineSemaphores(device)) {
+                interopRejection = "matching Vulkan adapter does not support timeline semaphores";
+                continue;
+            }
+            if (!supportsD3D11FenceImport(device)) {
+                interopRejection = "matching Vulkan adapter cannot import timeline D3D11 fence handles";
+                continue;
+            }
+            if (requireYcbcrImageArrays_ && !supportsYcbcrImageArrays(device)) {
+                interopRejection = "matching Vulkan adapter lacks VK_EXT_ycbcr_image_arrays/samplerYcbcrConversion "
+                                   "(required for the layered D3D11 NV12 decoder array)";
+                continue;
+            }
+            VkFormatProperties yProperties{}, uvProperties{};
+            vkGetPhysicalDeviceFormatProperties(device, VK_FORMAT_R8_UNORM, &yProperties);
+            vkGetPhysicalDeviceFormatProperties(device, VK_FORMAT_R8G8_UNORM, &uvProperties);
+            if ((yProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) == 0 ||
+                (uvProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) == 0) {
+                interopRejection = "matching Vulkan adapter cannot sample R8/R8G8 NV12 plane views";
+                continue;
+            }
+        }
         VkFormatProperties rgba16{};
         vkGetPhysicalDeviceFormatProperties(device, VK_FORMAT_R16G16B16A16_SFLOAT, &rgba16);
         constexpr VkFormatFeatureFlags required = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
@@ -165,6 +251,12 @@ void VulkanContext::selectPhysicalDevice() {
         }
     }
     if (!physicalDevice_) {
+        if (requiredAdapterLuid_) {
+            if (!matchingLuidSeen) {
+                throw std::runtime_error("No presentation-capable Vulkan device has the D3D11VA decoder adapter LUID");
+            }
+            if (!interopRejection.empty()) throw std::runtime_error("D3D11/Vulkan interop unavailable: " + interopRejection);
+        }
         throw std::runtime_error("No suitable Vulkan 1.2 device: graphics+compute+present queue, timestamp queries, VK_KHR_swapchain, and RGBA16F sampled/storage images are required");
     }
     vkGetPhysicalDeviceMemoryProperties(physicalDevice_, &memoryProperties_);
@@ -174,10 +266,27 @@ void VulkanContext::selectPhysicalDevice() {
 void VulkanContext::createDevice() {
     constexpr float priority = 1.0F;
     const VkDeviceQueueCreateInfo queue{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, nullptr, 0, graphicsFamily_, 1, &priority};
-    constexpr std::array extensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    std::vector<const char*> extensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    if (requiredAdapterLuid_) {
+#ifdef _WIN32
+        extensions.push_back("VK_KHR_external_memory_win32");
+        extensions.push_back("VK_KHR_external_semaphore_win32");
+#endif
+    }
+    if (requireYcbcrImageArrays_) extensions.push_back(VK_EXT_YCBCR_IMAGE_ARRAYS_EXTENSION_NAME);
     VkPhysicalDeviceFeatures features{};
     features.shaderStorageImageExtendedFormats = VK_TRUE;
+    VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcrConversion{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES};
+    ycbcrConversion.samplerYcbcrConversion = VK_TRUE;
+    VkPhysicalDeviceYcbcrImageArraysFeaturesEXT ycbcrArrays{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_YCBCR_IMAGE_ARRAYS_FEATURES_EXT};
+    ycbcrArrays.pNext = &ycbcrConversion;
+    ycbcrArrays.ycbcrImageArrays = VK_TRUE;
+    VkPhysicalDeviceTimelineSemaphoreFeatures timeline{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+    if (requireYcbcrImageArrays_) timeline.pNext = &ycbcrArrays;
+    if (requiredAdapterLuid_) timeline.timelineSemaphore = VK_TRUE;
     VkDeviceCreateInfo create{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    if (requiredAdapterLuid_) create.pNext = &timeline;
+    ycbcrImageArraysEnabled_ = requireYcbcrImageArrays_;
     create.queueCreateInfoCount = 1;
     create.pQueueCreateInfos = &queue;
     create.enabledExtensionCount = static_cast<std::uint32_t>(extensions.size());
@@ -206,7 +315,6 @@ void VulkanContext::createCommandResources() {
         const VkSemaphoreCreateInfo semaphore{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         const VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, nullptr, VK_FENCE_CREATE_SIGNALED_BIT};
         vkCheck(vkCreateSemaphore(device_, &semaphore, nullptr, &flights_[i].imageAvailable), "vkCreateSemaphore(image available)");
-        vkCheck(vkCreateSemaphore(device_, &semaphore, nullptr, &flights_[i].renderComplete), "vkCreateSemaphore(render complete)");
         vkCheck(vkCreateFence(device_, &fence, nullptr, &flights_[i].fence), "vkCreateFence");
         nameObject(VK_OBJECT_TYPE_COMMAND_BUFFER, reinterpret_cast<std::uint64_t>(commands[i]), std::format("Frame {} command buffer", i).c_str());
     }
@@ -284,6 +392,11 @@ void VulkanContext::createSwapchain() {
         vkCheck(vkCreateFramebuffer(device_, &framebuffer, nullptr, &framebuffers_[i]), "vkCreateFramebuffer");
     }
     imagesInFlight_.assign(imageCount, VK_NULL_HANDLE);
+    renderComplete_.assign(imageCount, VK_NULL_HANDLE);
+    const VkSemaphoreCreateInfo semaphore{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    for (auto& renderComplete : renderComplete_) {
+        vkCheck(vkCreateSemaphore(device_, &semaphore, nullptr, &renderComplete), "vkCreateSemaphore(render complete)");
+    }
     Log::info(std::format("Swapchain: format {} colorspace {}, {}x{}, present mode {}, {} images",
         static_cast<int>(surfaceFormat_.format), static_cast<int>(surfaceFormat_.colorSpace),
         swapchainExtent_.width, swapchainExtent_.height, presentModeName_, imageCount));
@@ -312,6 +425,8 @@ void VulkanContext::destroySwapchain() noexcept {
     swapchainViews_.clear();
     swapchainImages_.clear();
     imagesInFlight_.clear();
+    for (const auto renderComplete : renderComplete_) if (renderComplete) vkDestroySemaphore(device_, renderComplete, nullptr);
+    renderComplete_.clear();
     if (swapchain_) vkDestroySwapchainKHR(device_, swapchain_, nullptr);
     swapchain_ = VK_NULL_HANDLE;
 }
@@ -343,15 +458,30 @@ std::optional<VulkanContext::AcquiredFrame> VulkanContext::acquireFrame() {
     return AcquiredFrame{currentFlight_, imageIndex, flight.commandBuffer, timings};
 }
 
-void VulkanContext::submitAndPresent(const AcquiredFrame& frame) {
+void VulkanContext::submitAndPresent(const AcquiredFrame& frame, std::optional<TimelineWait> timelineWait) {
     vkCheck(vkEndCommandBuffer(frame.commandBuffer), "vkEndCommandBuffer");
     auto& flight = flights_[frame.flightIndex];
-    constexpr VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    const VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 1, &flight.imageAvailable, &waitStage,
-        1, &frame.commandBuffer, 1, &flight.renderComplete};
+    constexpr VkPipelineStageFlags imageWaitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    std::array<VkSemaphore, 2> waitSemaphores{flight.imageAvailable, VK_NULL_HANDLE};
+    std::array<VkPipelineStageFlags, 2> waitStages{imageWaitStage, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT};
+    std::array<std::uint64_t, 2> waitValues{0, 0};
+    const std::uint32_t waitCount = timelineWait ? 2U : 1U;
+    if (timelineWait) {
+        waitSemaphores[1] = timelineWait->semaphore;
+        waitStages[1] = timelineWait->stage;
+        waitValues[1] = timelineWait->value;
+    }
+    const std::uint64_t signalValue{};
+    VkTimelineSemaphoreSubmitInfo timelineInfo{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    timelineInfo.waitSemaphoreValueCount = waitCount;
+    timelineInfo.pWaitSemaphoreValues = waitValues.data();
+    timelineInfo.signalSemaphoreValueCount = 1;
+    timelineInfo.pSignalSemaphoreValues = &signalValue;
+    const VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO, timelineWait ? &timelineInfo : nullptr,
+        waitCount, waitSemaphores.data(), waitStages.data(), 1, &frame.commandBuffer, 1, &renderComplete_[frame.imageIndex]};
     vkCheck(vkQueueSubmit(graphicsQueue_, 1, &submit, flight.fence), "vkQueueSubmit");
     flight.submitted = true;
-    const VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, nullptr, 1, &flight.renderComplete,
+    const VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, nullptr, 1, &renderComplete_[frame.imageIndex],
         1, &swapchain_, &frame.imageIndex, nullptr};
     const VkResult result = vkQueuePresentKHR(graphicsQueue_, &present);
     currentFlight_ = (currentFlight_ + 1) % framesInFlight;

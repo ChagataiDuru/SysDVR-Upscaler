@@ -137,7 +137,7 @@ TEST_CASE("CLI defaults to decoder readback path") {
     CHECK(static_cast<int>(result.config->decoderPath) == static_cast<int>(ns60::DecoderPath::Readback));
 }
 
-TEST_CASE("CLI scaffolds explicit D3D11 Vulkan interop") {
+TEST_CASE("CLI parses explicit D3D11 Vulkan interop") {
     const auto result = ns60::parseCommandLine({"app", "--source", "sysdvr-pipe", "--decoder", "d3d11va",
         "--decoder-path", "interop"}, false);
     REQUIRE(result.config);
@@ -146,4 +146,16 @@ TEST_CASE("CLI scaffolds explicit D3D11 Vulkan interop") {
     CHECK_FALSE(ns60::parseCommandLine({"app", "--input", "x.mp4", "--decoder-path", "interop"}, false).config);
     CHECK_FALSE(ns60::parseCommandLine({"app", "--input", "x.mp4", "--decoder", "auto", "--decoder-path", "interop"}, false).config);
     CHECK_FALSE(ns60::parseCommandLine({"app", "--input", "x.mp4", "--decoder-path", "zero-copy"}, false).config);
+}
+
+TEST_CASE("CLI parses explicit D3D11 Vulkan GPU-copy interop") {
+    const auto result = ns60::parseCommandLine({"app", "--input", "x.mp4", "--decoder", "d3d11va",
+        "--decoder-path", "interop-copy"}, false);
+    REQUIRE(result.config);
+    CHECK(static_cast<int>(result.config->decoderPath) == static_cast<int>(ns60::DecoderPath::D3D11VulkanInteropCopy));
+    CHECK(ns60::usesD3D11VulkanInterop(result.config->decoderPath));
+    CHECK_FALSE(ns60::usesD3D11VulkanInterop(ns60::DecoderPath::Readback));
+
+    CHECK_FALSE(ns60::parseCommandLine({"app", "--input", "x.mp4", "--decoder-path", "interop-copy"}, false).config);
+    CHECK_FALSE(ns60::parseCommandLine({"app", "--input", "x.mp4", "--decoder", "auto", "--decoder-path", "interop-copy"}, false).config);
 }

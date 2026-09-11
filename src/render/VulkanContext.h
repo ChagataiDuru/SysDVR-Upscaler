@@ -1,5 +1,6 @@
 #pragma once
 
+#include "decode/DecodedFrame.h"
 #include "platform/Window.h"
 #include "telemetry/Metrics.h"
 
@@ -24,13 +25,21 @@ public:
         std::optional<GpuTimings> completedTimings;
     };
 
-    VulkanContext(Window& window, bool validation, bool vsync);
+    struct TimelineWait {
+        VkSemaphore semaphore{};
+        std::uint64_t value{};
+        VkPipelineStageFlags stage{VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT};
+    };
+
+    VulkanContext(Window& window, bool validation, bool vsync,
+                  std::optional<AdapterLuid> requiredAdapterLuid = std::nullopt,
+                  bool requireYcbcrImageArrays = false);
     ~VulkanContext();
     VulkanContext(const VulkanContext&) = delete;
     VulkanContext& operator=(const VulkanContext&) = delete;
 
     [[nodiscard]] std::optional<AcquiredFrame> acquireFrame();
-    void submitAndPresent(const AcquiredFrame& frame);
+    void submitAndPresent(const AcquiredFrame& frame, std::optional<TimelineWait> timelineWait = std::nullopt);
     void setTimingPlan(std::uint32_t flight, const std::array<GpuPass, 4>& stages, std::uint32_t count) noexcept;
     void waitIdle() const noexcept;
     void recreateSwapchain();
@@ -52,13 +61,13 @@ public:
     [[nodiscard]] const std::string& gpuName() const noexcept { return gpuName_; }
     [[nodiscard]] const std::string& presentModeName() const noexcept { return presentModeName_; }
     [[nodiscard]] bool validationEnabled() const noexcept { return validationEnabled_; }
+    [[nodiscard]] bool ycbcrImageArraysEnabled() const noexcept { return ycbcrImageArraysEnabled_; }
     void nameObject(VkObjectType type, std::uint64_t handle, const char* name) const noexcept;
 
 private:
     struct Flight {
         VkCommandBuffer commandBuffer{};
         VkSemaphore imageAvailable{};
-        VkSemaphore renderComplete{};
         VkFence fence{};
         bool submitted{};
         std::array<GpuPass, 4> timingStages{};
@@ -76,7 +85,10 @@ private:
 
     Window& window_;
     bool validationEnabled_{};
+    bool requireYcbcrImageArrays_{};
+    bool ycbcrImageArraysEnabled_{};
     bool vsync_{};
+    std::optional<AdapterLuid> requiredAdapterLuid_;
     VkInstance instance_{};
     VkDebugUtilsMessengerEXT debugMessenger_{};
     VkSurfaceKHR surface_{};
@@ -94,6 +106,9 @@ private:
     std::vector<VkImageView> swapchainViews_;
     std::vector<VkFramebuffer> framebuffers_;
     std::vector<VkFence> imagesInFlight_;
+    // One per swapchain image: a present may still hold its wait semaphore after
+    // the flight's fence signals, so per-flight semaphores can be re-signaled early.
+    std::vector<VkSemaphore> renderComplete_;
     VkRenderPass renderPass_{};
     VkCommandPool commandPool_{};
     VkQueryPool queryPool_{};

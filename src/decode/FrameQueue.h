@@ -28,6 +28,7 @@ public:
     [[nodiscard]] std::optional<std::size_t> acquireRead();
     [[nodiscard]] std::optional<std::size_t> tryAcquireNewest();
     void releaseRead(std::size_t slot);
+    void discardReady() noexcept;
     void stop() noexcept;
     [[nodiscard]] bool stopped() const noexcept;
     [[nodiscard]] std::size_t occupancy() const noexcept;

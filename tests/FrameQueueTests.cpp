@@ -7,10 +7,30 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <memory>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 using namespace std::chrono_literals;
+
+namespace {
+class TestLease final : public ns60::D3D11FrameLease {
+public:
+    explicit TestLease(std::shared_ptr<int> lifetime) : lifetime_(std::move(lifetime)) {}
+    [[nodiscard]] const ns60::D3D11TextureDescription& description() const noexcept override { return description_; }
+    [[nodiscard]] ns60::AdapterLuid adapterLuid() const noexcept override { return {}; }
+    [[nodiscard]] std::uintptr_t fenceIdentity() const noexcept override { return 1; }
+    [[nodiscard]] ns60::PlatformHandle createTextureHandle() const override { return {}; }
+    [[nodiscard]] ns60::PlatformHandle createFenceHandle() const override { return {}; }
+private:
+    ns60::D3D11TextureDescription description_{};
+    std::shared_ptr<int> lifetime_;
+};
+}
+
+static_assert(!std::is_copy_constructible_v<ns60::DecodedFrame>);
+static_assert(std::is_nothrow_move_constructible_v<ns60::DecodedFrame>);
 
 TEST_CASE("FrameQueue preserves order, wraps, and reuses slots") {
     ns60::FramePool pool(4, 16, 16);
@@ -199,4 +219,99 @@ TEST_CASE("FramePool allocates NV12-capable chroma storage") {
     CHECK(slot.vPlane.size() == 8 * 8);
     CHECK(static_cast<int>(slot.storage) == static_cast<int>(ns60::DecodedFrameStorage::CpuYuv420P));
     CHECK(static_cast<int>(slot.metadata.storage) == static_cast<int>(ns60::DecodedFrameStorage::CpuYuv420P));
+}
+
+TEST_CASE("Interop frame pools can omit all CPU plane allocations") {
+    ns60::FramePool pool(2, 16, 16, false);
+    CHECK(pool.at(0).yPlane.empty());
+    CHECK(pool.at(0).uPlane.empty());
+    CHECK(pool.at(0).vPlane.empty());
+}
+
+TEST_CASE("D3D11 interop pool includes every externally retained surface") {
+    CHECK(ns60::d3d11InteropPoolSize(12, 4 + 3 + 1 + 1) == 21);
+    CHECK_THROWS_AS((void)ns60::d3d11InteropPoolSize(2040, 9), std::runtime_error);
+}
+
+TEST_CASE("Adapter LUID matching requires two valid identical identifiers") {
+    ns60::AdapterLuid first{{1, 2, 3, 4, 5, 6, 7, 8}, true};
+    ns60::AdapterLuid same = first;
+    ns60::AdapterLuid different{{1, 2, 3, 4, 5, 6, 7, 9}, true};
+    ns60::AdapterLuid invalid = first;
+    invalid.valid = false;
+    CHECK(ns60::adapterLuidsMatch(first, same));
+    CHECK_FALSE(ns60::adapterLuidsMatch(first, different));
+    CHECK_FALSE(ns60::adapterLuidsMatch(first, invalid));
+}
+
+TEST_CASE("Interop cache keys distinguish pool generations and array slices") {
+    const ns60::ExternalTextureKey first{2, 0x1234};
+    CHECK(first == ns60::ExternalTextureKey{2, 0x1234});
+    CHECK_FALSE(first == ns60::ExternalTextureKey{3, 0x1234});
+    CHECK_FALSE(ns60::ExternalViewKey{first, 1} == ns60::ExternalViewKey{first, 2});
+}
+
+TEST_CASE("Cancelled and stopped interop leases release immediately") {
+    ns60::FramePool pool(1, 16, 16, false);
+    ns60::FrameQueue queue(pool);
+    auto lifetime = std::make_shared<int>(7);
+    std::weak_ptr<int> observed = lifetime;
+
+    auto write = queue.acquireWriteLatest();
+    REQUIRE(write);
+    pool.at(*write).storage = ns60::DecodedFrameStorage::D3D11Nv12;
+    pool.at(*write).d3d11Lease = std::make_shared<TestLease>(lifetime);
+    lifetime.reset();
+    queue.cancelWrite(*write);
+    CHECK(observed.expired());
+
+    lifetime = std::make_shared<int>(8);
+    observed = lifetime;
+    write = queue.acquireWriteLatest();
+    REQUIRE(write);
+    pool.at(*write).d3d11Lease = std::make_shared<TestLease>(lifetime);
+    lifetime.reset();
+    queue.commitWrite(*write);
+    queue.stop();
+    CHECK(observed.expired());
+}
+
+TEST_CASE("Displayed and flight owners retain an interop lease until the final release") {
+    ns60::FramePool pool(1, 16, 16, false);
+    ns60::FrameQueue queue(pool);
+    auto lifetime = std::make_shared<int>(9);
+    std::weak_ptr<int> observed = lifetime;
+
+    const auto write = queue.acquireWrite();
+    REQUIRE(write);
+    pool.at(*write).storage = ns60::DecodedFrameStorage::D3D11Nv12;
+    pool.at(*write).d3d11Lease = std::make_shared<TestLease>(lifetime);
+    lifetime.reset();
+    queue.commitWrite(*write);
+
+    const auto read = queue.acquireRead();
+    REQUIRE(read);
+    auto displayed = pool.at(*read).d3d11Lease;
+    auto flight = displayed;
+    queue.releaseRead(*read);
+    CHECK_FALSE(observed.expired());
+    displayed.reset();
+    CHECK_FALSE(observed.expired());
+    flight.reset();
+    CHECK(observed.expired());
+}
+
+TEST_CASE("Discarding queued interop frames releases their leases") {
+    ns60::FramePool pool(1, 16, 16, false);
+    ns60::FrameQueue queue(pool);
+    auto lifetime = std::make_shared<int>(10);
+    std::weak_ptr<int> observed = lifetime;
+
+    const auto write = queue.acquireWrite();
+    REQUIRE(write);
+    pool.at(*write).d3d11Lease = std::make_shared<TestLease>(lifetime);
+    lifetime.reset();
+    queue.commitWrite(*write);
+    queue.discardReady();
+    CHECK(observed.expired());
 }
