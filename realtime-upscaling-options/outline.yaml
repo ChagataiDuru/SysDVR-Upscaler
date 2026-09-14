@@ -1,0 +1,138 @@
+topic: >-
+  Real-time low-latency upscaling options for improving graphical quality of decoded
+  Nintendo Switch SysDVR H.264 video (720p to 1080p or higher) in NexusStream60,
+  a C++20/Vulkan 1.2 client on Windows and macOS (Apple Silicon via MoltenVK)
+
+context:
+  current_upscalers: [Nearest, Bilinear, BicubicCatmullRom, Lanczos2, BilinearCas, Lanczos2Cas, Fsr1Easu, Fsr1EasuRcas]
+  current_chroma_modes: [Bilinear, BicubicCatmullRom, Lanczos2, EdgeAware]
+  pipeline: >-
+    FFmpeg decode (software / D3D11VA interop-copy / VideoToolbox readback) -> YUV->RGB compute
+    into RGBA16F -> upscale/sharpen compute passes -> fullscreen present (sRGB swapchain).
+    framesInFlight independent FlightResources sets; no per-frame allocation.
+  input_constraints: >-
+    Decoded H.264 frames only: no engine motion vectors, depth, or camera jitter. Compression
+    artifacts (blocking, ringing, banding) are present. Switch sources are 720p (some 1080p docked),
+    often 30 or 60 fps.
+  gpu_budget_upscale_stage_ms: 5
+  target_resolutions: [1080p, 1440p, 4K]
+  reference_hardware:
+    windows: NVIDIA RTX 3060 (driver 616.92)
+    macos: Apple Silicon M-series via MoltenVK
+  research_since: 2024-01-01
+
+items:
+  # A. Spatial game upscalers (drop-in compute shaders)
+  - name: FSR 1 tuning (baseline)
+    category: spatial
+    description: Current EASU/RCAS baseline; luma-only EASU, RCAS denoise, pre-chroma ordering, parameter tuning for H.264 input.
+  - name: NVIDIA Image Scaling (NIS)
+    category: spatial
+    description: MIT, 6-tap edge-adaptive scaler + sharpener with GLSL/HLSL source; v1.0.3, frozen.
+  - name: Snapdragon Game Super Resolution 1 (SGSR1)
+    category: spatial
+    description: BSD-3 single-pass edge-directed spatial upscaler, cheaper than EASU; Magpie has a port.
+  - name: MetalFX Spatial Scaler
+    category: spatial
+    description: Apple spatial scaler (used by Moonlight-qt on macOS); needs Metal<->Vulkan interop via VK_EXT_metal_objects.
+
+  # B. Temporal game upscalers (fit check without engine inputs)
+  - name: AMD FSR 2 / 3.1 / 4 (FidelityFX SDK 2.0)
+    category: temporal-fit-check
+    description: FSR 3.1 open source with Vulkan; FSR 4 ML is signed DX12-only DLLs. Needs motion vectors, depth, jitter.
+  - name: DLSS 4.5 / XeSS 3 / MetalFX Temporal
+    category: temporal-fit-check
+    description: Proprietary temporal upscalers; document whether any can run on video with synthetic motion vectors.
+  - name: Arm Accuracy Super Resolution (ASR)
+    category: temporal-fit-check
+    description: MIT FSR2-derived temporal upscaler (GDC 2025); most portable temporal candidate for MoltenVK.
+  - name: Snapdragon Game Super Resolution 2 (SGSR2)
+    category: temporal-fit-check
+    description: Lightweight temporal upscaler (Oct 2024) with a Vulkan sample; motion-vector requirement.
+  - name: Motion vector sources for video (FFmpeg export_mvs, VK_NV_optical_flow / NVOF SDK 5)
+    category: temporal-fit-check
+    description: Decoder-exported H.264 MVs (software decode only) vs hardware optical flow (Ampere+, not MoltenVK) as inputs for temporal upscaling.
+
+  # C. Video-specific super-resolution
+  - name: NVIDIA RTX Video SDK (VSR)
+    category: video-sr
+    description: v1.1, DX11/DX12/Vulkan/CUDA on RTX 20+; decoded-video SR with artifact reduction, 10-bit support.
+  - name: D3D11/D3D12 VideoProcessor vendor extensions (NVIDIA / Intel VSR)
+    category: video-sr
+    description: Driver-level VSR via VideoProcessorSetOutputExtension (mpv d3d11vpp scaling-mode); could hang off the interop-copy path.
+  - name: NVIDIA Maxine Video Effects SDK (Artifact Reduction + Super Resolution)
+    category: video-sr
+    description: TensorRT-based AR + SR with 1.5x scale factor (exact 720p->1080p); RTX only.
+  - name: Apple VideoToolbox VTFrameProcessor super resolution (VTLowLatencySuperResolutionScaler)
+    category: video-sr
+    description: macOS 26 ML SR; reportedly 2x/4x only (1.5x needs downscale). Also evaluate VTTemporalNoiseFilter as a pre-pass.
+  - name: AMD AMF Video Upscaling / HQ Scaler
+    category: video-sr
+    description: ML model based on FSR1 with good deblocking (Moonlight-qt); FFmpeg sr_amf / vpp_amf filters.
+  - name: Intel VPL AI super resolution
+    category: video-sr
+    description: oneVPL VPP AI SR on Arc / Xe GPUs.
+  - name: Windows App SDK AI Video Super Resolution / Auto SR / DirectSR
+    category: video-sr
+    description: Likely rejected (NPU/CPU-only face-trained VSR; Copilot+ system SR; DX12 temporal API); record why.
+
+  # D. Neural shader ecosystem (portable GLSL/HLSL)
+  - name: Anime4K
+    category: neural-shader
+    description: CNN upscale/restore GLSL shaders incl. 3D-game variants (3D_Upscale_US, 3D_AA_Upscale_US) and Restore for compression artifacts.
+  - name: CuNNy
+    category: neural-shader
+    description: Small fast CNN upscalers (veryfast..8x32, DS/SOFT variants) as mpv GLSL and Magpie HLSL; strong on text/UI.
+  - name: ArtCNN
+    category: neural-shader
+    description: C4F16/C4F32 with DS/DN variants; top in author's mpv scaler evaluation; ONNX + GLSL weights.
+  - name: FSRCNNX
+    category: neural-shader
+    description: Classic small CNN luma upscaler in GLSL; reference point for CNN shader cost/quality.
+  - name: RAVU / NNEDI3
+    category: neural-shader
+    description: Trained edge-directed upscalers (compute and fragment variants) from the mpv ecosystem.
+  - name: libplacebo
+    category: neural-shader
+    description: Vulkan-native renderer (v7.360.x) hosting custom shaders, EWA/polar Lanczos, debanding; MoltenVK timeline-semaphore workaround.
+  - name: Magpie effect library
+    category: neural-shader
+    description: HLSL porting reference with SGSR1, CuNNy, Anime4K, FSRCNNX, ACNet, NIS, RAVU, NNEDI3, deband; check license.
+
+  # E. ML models and inference runtimes
+  - name: SPAN / Real-ESRGAN Compact via mpv-AnimeJaNai
+    category: ml-runtime
+    description: Real-time 2x via TensorRT/DirectML with GPU-kept frames; RTX 3060 is the minimum for the Performance profile. Benchmark for 5 ms viability.
+  - name: Inference runtimes (TensorRT for RTX / Windows ML / ONNX Runtime CoreML / ncnn-vulkan)
+    category: ml-runtime
+    description: Compare runtimes for hosting a tiny SR model with GPU interop on both platforms; DirectML is in maintenance.
+  - name: Efficient SR architectures (NTIRE 2025/2026 ESR, AIM 2024 compressed VSR, codec-assisted VSR)
+    category: ml-runtime
+    description: Tiny CNN/compression-aware designs portable to custom compute shaders; research-only codec-MV reuse (CIAF).
+  - name: Arm Neural Super Sampling + ML SDK for Vulkan
+    category: ml-runtime
+    description: VK_ARM_tensors / VK_ARM_data_graph with open models; future watch, not native on NVIDIA or MoltenVK.
+
+  # F. Compression-aware pre/post passes
+  - name: Deblocking / deringing / debanding pre-passes
+    category: pre-post-pass
+    description: GPU deblock, dering, deband (libplacebo deband, FFmpeg nlmeans_vulkan) before upscale; cost vs quality gain on H.264.
+  - name: Chroma reconstruction (CfL / KrigBilateral)
+    category: pre-post-pass
+    description: Chroma-from-luma and bilateral chroma upscalers vs existing EdgeAware mode for 4:2:0 input.
+
+  # G. Reference designs and platform
+  - name: Moonlight-qt VSR (PR 1557) reference design
+    category: reference
+    description: Low-latency streaming client using NVIDIA VSR (D3D12), AMD AMF, FSR1 fallback, MetalFX Spatial; <1-2 ms added.
+  - name: chiaki-ng libplacebo renderer reference design
+    category: reference
+    description: PlayStation Remote Play client with libplacebo Vulkan renderer, deband, upscaler presets, custom shaders.
+  - name: KosmicKrisp vs MoltenVK (macOS Vulkan driver)
+    category: platform
+    description: LunarG Mesa-based conformant Vulkan 1.3 on Apple Silicon; impact on shader features, interop, and portability subset.
+
+execution:
+  batch_size: 2
+  items_per_agent: 1
+  output_dir: ./realtime-upscaling-options/results

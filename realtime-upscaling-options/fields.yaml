@@ -1,0 +1,189 @@
+# detail_level: brief -> moderate -> detailed
+categories:
+  - name: basic_info
+    fields:
+      - name: name
+        description: Official name of the technique, SDK, or library.
+        detail_level: brief
+      - name: vendor
+        description: Company, project, or author.
+        detail_level: brief
+      - name: license
+        description: License of code and model weights (MIT, BSD, GPL, proprietary, signed DLL).
+        detail_level: brief
+      - name: latest_version_and_date
+        description: Latest release version and date (since 2024).
+        detail_level: brief
+      - name: maintenance_status
+        description: Active, maintenance-only, frozen, or abandoned.
+        detail_level: brief
+      - name: reference_client_precedent
+        description: Shipping low-latency clients or players already using it (Moonlight-qt, chiaki-ng, mpv, Magpie).
+        detail_level: moderate
+
+  - name: input_requirements
+    fields:
+      - name: spatial_or_temporal
+        description: Single-frame spatial, multi-frame temporal, or hybrid.
+        detail_level: brief
+      - name: needs_motion_vectors_depth_jitter
+        description: Which engine inputs are required and whether they are optional.
+        detail_level: moderate
+      - name: works_on_decoded_video
+        description: Whether it can run directly on decoded, compressed video frames without engine data.
+        detail_level: moderate
+      - name: motion_vector_source
+        description: For temporal methods, viable MV source (none, FFmpeg export_mvs, hardware optical flow, compute estimation), with its quality and cost.
+        detail_level: moderate
+      - name: input_format
+        description: Expected input (NV12, RGB, luma-only, RGBA16F) and colorspace/range assumptions.
+        detail_level: brief
+
+  - name: platform_api
+    fields:
+      - name: vulkan_compute_portable
+        description: Can it run as a Vulkan compute pass on both NVIDIA and MoltenVK.
+        detail_level: moderate
+      - name: shader_source_available
+        description: GLSL/HLSL/MSL source available, or binary/SDK only.
+        detail_level: brief
+      - name: windows_vendor_lock
+        description: GPU vendor or API (D3D11/D3D12/CUDA) restrictions on Windows.
+        detail_level: brief
+      - name: macos_vulkan_driver
+        description: Viability under MoltenVK and KosmicKrisp; what the portability subset rules out.
+        detail_level: moderate
+      - name: required_vulkan_extensions_features
+        description: Needed extensions/features (float16, storage formats, external memory, VK_EXT_metal_objects, VK_NV_optical_flow).
+        detail_level: moderate
+      - name: min_os_driver_and_user_toggle
+        description: Minimum OS/driver versions and whether a control-panel or user setting must be enabled.
+        detail_level: brief
+      - name: gpu_arch_minimum
+        description: Minimum GPU generation (Turing, Ampere, RDNA4, M1, etc.).
+        detail_level: brief
+      - name: accelerator_and_precision
+        description: Execution device (GPU, NPU/ANE, tensor cores) and numeric precision (FP32/FP16/INT8/FP8).
+        detail_level: brief
+
+  - name: scale_support
+    fields:
+      - name: scale_factor_constraints
+        description: Arbitrary ratio vs discrete factors (1.5x, 2x, 4x); whether 720p->1080p is native.
+        detail_level: moderate
+      - name: extra_downscale_cost
+        description: GPU time and quality cost when overshooting (e.g. 1440p) then resampling to the target.
+        detail_level: moderate
+      - name: supported_targets
+        description: Practical support for 720p->1080p, ->1440p, ->4K.
+        detail_level: brief
+
+  - name: performance
+    fields:
+      - name: gpu_ms_per_target_resolution
+        description: Measured or published GPU cost at 1080p/1440p/4K on RTX 3060 and Apple M-series (or scaled from nearest published hardware).
+        detail_level: detailed
+      - name: gpu_time_p99_and_pacing
+        description: Tail latency and frame pacing behavior, not only averages.
+        detail_level: moderate
+      - name: fits_5ms_budget
+        description: Yes/no/conditional verdict against the 5 ms upscale-stage budget at 720p->1080p.
+        detail_level: brief
+      - name: power_thermal
+        description: Sustained power/thermal cost on laptops and MacBooks.
+        detail_level: brief
+
+  - name: latency
+    fields:
+      - name: added_frames_of_delay
+        description: Frames of buffering or history introduced (temporal accumulation, async processors).
+        detail_level: moderate
+      - name: per_stage_latency_budget
+        description: Expected contribution per stage (decode, color, pre-pass, upscale, present) when integrated.
+        detail_level: detailed
+      - name: cpu_gpu_sync_or_readback_cost
+        description: Required CPU waits, readbacks, or cross-API copies and their cost.
+        detail_level: moderate
+      - name: pipeline_blocking_behavior
+        description: Whether calls block the render thread, need separate queues, or fit async submission.
+        detail_level: moderate
+      - name: warmup_engine_build_model_download
+        description: First-run engine builds, JIT compilation, model downloads, and first-frame stalls.
+        detail_level: moderate
+      - name: resolution_change_handling
+        description: Reinitialization cost when source or output resolution changes (static engines, fixed descriptors).
+        detail_level: brief
+
+  - name: quality
+    fields:
+      - name: compression_artifact_handling
+        description: Behavior on H.264 blocking, ringing, and banding (amplifies vs suppresses).
+        detail_level: detailed
+      - name: denoise_sharpen_variants
+        description: Availability of denoise/sharpen/restore variants aimed at compressed input.
+        detail_level: brief
+      - name: training_domain
+        description: For ML methods, what content it was trained on (anime, 3D games, faces, real video) and fit to Switch content.
+        detail_level: moderate
+      - name: text_ui_crispness
+        description: Quality on HUD, menus, and small text.
+        detail_level: moderate
+      - name: ringing_halos
+        description: Overshoot, haloing, and sharpening artifacts.
+        detail_level: brief
+      - name: flat_shaded_art
+        description: Quality on cel-shaded / flat-color Nintendo art styles.
+        detail_level: moderate
+      - name: temporal_stability_flicker
+        description: Flicker, shimmer, or ghosting across frames.
+        detail_level: moderate
+      - name: objective_quality_metrics
+        description: Published PSNR/SSIM/VMAF/LPIPS/FLIP results against native references, if any.
+        detail_level: moderate
+      - name: hdr_bitdepth_support
+        description: 10-bit and HDR handling.
+        detail_level: brief
+
+  - name: ns60_integration
+    fields:
+      - name: fits_rgba16f_compute_pass
+        description: Whether it slots in as a compute pass over the RGBA16F working images in FlightResources.
+        detail_level: moderate
+      - name: needs_d3d11_or_metal_interop
+        description: Interop required (D3D11/D3D12, CUDA, Metal) and how it relates to the existing interop-copy path and the known NVIDIA NV12 import issue.
+        detail_level: moderate
+      - name: ffmpeg_filter_availability
+        description: Existing FFmpeg filter (sr_amf, Vulkan filters, libplacebo) vs custom integration.
+        detail_level: brief
+      - name: model_weights_bundling
+        description: How weights are shipped (embedded in shader constants, files, runtime download).
+        detail_level: brief
+      - name: redistribution_footprint
+        description: Binary/runtime/weights size and redistribution rules.
+        detail_level: brief
+      - name: testability_in_ns60_core
+        description: What logic (parameter math, selection, factor mapping) can be unit-tested in ns60_core without a GPU.
+        detail_level: brief
+      - name: integration_sketch
+        description: Concrete steps to add it as a new UpscaleMode / pre-pass, including shader list and resource changes.
+        detail_level: detailed
+
+  - name: risk_effort
+    fields:
+      - name: implementation_size
+        description: Estimated effort (small/medium/large) and main work items.
+        detail_level: moderate
+      - name: license_compatibility
+        description: Compatibility with this repo's distribution; GPL/LGPL obligations when porting mpv or Magpie shaders.
+        detail_level: moderate
+      - name: retrainable_open_weights
+        description: Whether weights and training code are open for fine-tuning on Switch captures.
+        detail_level: brief
+      - name: known_driver_issues
+        description: Known bugs on NVIDIA, MoltenVK, or Apple drivers relevant to this pipeline.
+        detail_level: moderate
+      - name: recommendation
+        description: Adopt / prototype / watch / reject for NS60, with a one-paragraph rationale.
+        detail_level: moderate
+
+uncertain: []
