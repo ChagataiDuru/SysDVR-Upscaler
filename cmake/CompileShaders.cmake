@@ -1,6 +1,6 @@
 function(ns60_compile_shaders target)
-  find_program(NS60_GLSLC glslc HINTS "$ENV{VULKAN_SDK}/Bin")
-  find_program(NS60_GLSLANG glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin")
+  find_program(NS60_GLSLC glslc HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+  find_program(NS60_GLSLANG glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
   if(NOT NS60_GLSLC AND NOT NS60_GLSLANG)
     message(FATAL_ERROR
       "No GLSL-to-SPIR-V compiler found. Install the Vulkan SDK and set VULKAN_SDK; "

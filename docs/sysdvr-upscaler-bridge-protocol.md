@@ -4,7 +4,12 @@ This document describes protocol version 1 used between `SysDVR-UpscalerBridge` 
 
 ## Transport
 
-The parent application creates one local Windows byte-stream named pipe and accepts one client. The bridge connects as a named-pipe client to `\\.\pipe\<pipe-name>`. Message boundaries are defined only by the binary headers below; Windows message-mode pipe boundaries are not used.
+The parent application creates one local byte-stream endpoint and accepts one client. The bridge connects with .NET's `NamedPipeClientStream`, so the endpoint depends on the platform:
+
+- **Windows:** a byte-mode named pipe at `\\.\pipe\<pipe-name>`.
+- **macOS:** a Unix domain stream socket, placed exactly where .NET looks for it. A plain `<pipe-name>` maps to `$TMPDIR/CoreFxPipe_<pipe-name>` (`/tmp/CoreFxPipe_<pipe-name>` when `TMPDIR` is unset); an absolute `<pipe-name>` is the socket path itself. Managed launches pass an absolute `$TMPDIR/ns60-<pid>-<ticks>.sock`. The parent restricts the socket to its user (mode 0600), replaces a stale socket file left by an earlier run, refuses to replace any other file type, and removes the socket on shutdown. Socket paths are limited to 103 bytes.
+
+Message boundaries are defined only by the binary headers below; Windows message-mode pipe boundaries are not used.
 
 All integers are little-endian. Native C# or C++ structs are never serialized directly.
 

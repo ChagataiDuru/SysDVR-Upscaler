@@ -43,9 +43,14 @@ Window::Window(int width, int height, std::string title, bool fullscreen, bool b
     : fullscreen_(fullscreen), borderless_(borderless), windowedWidth_(width), windowedHeight_(height) {
     if (glfwUsers++ == 0) {
         glfwSetErrorCallback(glfwError);
+        // Bind GLFW to the Vulkan loader this executable links. Otherwise GLFW
+        // dlopens libvulkan by name, which can resolve to a second loader (e.g.
+        // the SDK's via DYLD_LIBRARY_PATH on macOS) whose dispatch does not
+        // match our VkInstance and crashes surface creation.
+        glfwInitVulkanLoader(vkGetInstanceProcAddr);
         if (glfwInit() != GLFW_TRUE) {
             --glfwUsers;
-            throw std::runtime_error("GLFW initialization failed; verify that an interactive Windows desktop is available");
+            throw std::runtime_error("GLFW initialization failed; verify that an interactive desktop session is available");
         }
     }
     monitor_ = selectMonitor(monitorIndex, monitorIndex_);
@@ -104,7 +109,7 @@ WindowEvents Window::consumeEvents() noexcept {
 VkSurfaceKHR Window::createSurface(VkInstance instance) const {
     VkSurfaceKHR surface{};
     const VkResult result = glfwCreateWindowSurface(instance, window_, nullptr, &surface);
-    if (result != VK_SUCCESS) throw std::runtime_error("GLFW failed to create a Vulkan Win32 surface (VkResult " + std::to_string(result) + ")");
+    if (result != VK_SUCCESS) throw std::runtime_error("GLFW failed to create a Vulkan window surface (VkResult " + std::to_string(result) + ")");
     return surface;
 }
 

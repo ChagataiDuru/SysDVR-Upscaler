@@ -4,7 +4,9 @@
 
 namespace ns60 {
 
-enum class DecoderBackend { Software, D3D11VA, Auto };
+// Auto resolves to the platform's hardware backend at open time (D3D11VA on
+// Windows, VideoToolbox on macOS) and falls back to software.
+enum class DecoderBackend { Software, D3D11VA, Auto, VideoToolbox };
 // D3D11VulkanInterop imports the decoder's texture array directly (zero-copy).
 // D3D11VulkanInteropCopy copies each decoded slice on the GPU into a standalone
 // shared NV12 texture first, for drivers whose decoder-array layout does not
@@ -15,11 +17,16 @@ enum class DecoderPath { Readback, D3D11VulkanInterop, D3D11VulkanInteropCopy };
     return path == DecoderPath::D3D11VulkanInterop || path == DecoderPath::D3D11VulkanInteropCopy;
 }
 
+[[nodiscard]] constexpr bool isHardwareBackend(DecoderBackend backend) noexcept {
+    return backend == DecoderBackend::D3D11VA || backend == DecoderBackend::VideoToolbox;
+}
+
 [[nodiscard]] inline std::string_view toString(DecoderBackend backend) noexcept {
     switch (backend) {
     case DecoderBackend::Software: return "software";
     case DecoderBackend::D3D11VA: return "d3d11va";
     case DecoderBackend::Auto: return "auto";
+    case DecoderBackend::VideoToolbox: return "videotoolbox";
     }
     return "unknown";
 }

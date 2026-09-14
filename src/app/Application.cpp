@@ -36,6 +36,16 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <cerrno>
+#include <csignal>
+#include <cstdlib>
+#include <spawn.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+extern char** environ;
 #endif
 
 namespace ns60 {
@@ -221,10 +231,117 @@ BridgeProcess launchSysDvrBridge(const AppConfig& config) {
     return BridgeProcess(process);
 }
 #else
-std::string makeUniquePipeName() { return {}; }
-class BridgeProcess final {};
-BridgeProcess launchSysDvrBridge(const AppConfig&) {
-    throw std::runtime_error("Unified SysDVR launch is only available on Windows");
+// The bridge's NamedPipeClientStream uses a rooted name verbatim as its Unix
+// socket path, so an absolute path skips .NET's CoreFxPipe_ prefix.
+std::string makeUniquePipeName() {
+    const auto ticks = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count();
+    const char* temp = std::getenv("TMPDIR");
+    std::string directory = temp && *temp ? temp : "/tmp/";
+    if (directory.back() != '/') directory.push_back('/');
+    return std::format("{}ns60-{}-{}.sock", directory, static_cast<long>(::getpid()), ticks);
+}
+
+pid_t reapChild(pid_t pid, int options) noexcept {
+    int status{};
+    pid_t result{};
+    do {
+        result = ::waitpid(pid, &status, options);
+    } while (result < 0 && errno == EINTR);
+    return result;
+}
+
+class BridgeProcess final {
+public:
+    BridgeProcess() = default;
+    explicit BridgeProcess(pid_t pid) : pid_(pid) {}
+    ~BridgeProcess() { stop(); }
+    BridgeProcess(const BridgeProcess&) = delete;
+    BridgeProcess& operator=(const BridgeProcess&) = delete;
+    BridgeProcess(BridgeProcess&& other) noexcept : pid_(std::exchange(other.pid_, -1)) {}
+    BridgeProcess& operator=(BridgeProcess&& other) noexcept {
+        if (this != &other) {
+            stop();
+            pid_ = std::exchange(other.pid_, -1);
+        }
+        return *this;
+    }
+
+private:
+    pid_t pid_{-1};
+
+    // SIGTERM first so the bridge can release the USB device, then SIGKILL
+    // after the same 3 s budget the Windows path waits for.
+    void stop() noexcept {
+        if (pid_ <= 0) return;
+        if (reapChild(pid_, WNOHANG) == 0) {
+            ::kill(pid_, SIGTERM);
+            const auto deadline = Clock::now() + std::chrono::seconds(3);
+            pid_t reaped = 0;
+            while ((reaped = reapChild(pid_, WNOHANG)) == 0 && Clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            if (reaped == 0) {
+                ::kill(pid_, SIGKILL);
+                (void)reapChild(pid_, 0);
+            }
+        }
+        pid_ = -1;
+    }
+};
+
+BridgeProcess launchSysDvrBridge(const AppConfig& config) {
+    const auto executable = std::filesystem::absolute(config.sysdvrBridge);
+    if (!std::filesystem::exists(executable)) {
+        throw std::runtime_error("SysDVR bridge executable does not exist: " + executable.string());
+    }
+    if (::access(executable.c_str(), X_OK) != 0) {
+        throw std::runtime_error("SysDVR bridge is not executable: " + executable.string());
+    }
+
+    std::vector<std::string> arguments{
+        executable.string(),
+        "usb",
+        "--upscaler-video-pipe",
+        config.pipeName,
+        "--no-audio",
+        "--upscaler-pipe-queue-messages",
+        std::to_string(config.bridgePipeQueueMessages),
+        "--upscaler-pipe-queue-bytes",
+        std::to_string(config.bridgePipeQueueBytes),
+        "--upscaler-pipe-max-age-ms",
+        std::to_string(config.bridgePipeMaxAgeMs)
+    };
+    std::vector<char*> argv;
+    argv.reserve(arguments.size() + 1);
+    for (auto& argument : arguments) argv.push_back(argument.data());
+    argv.push_back(nullptr);
+    const auto workingDirectory = executable.parent_path().string();
+
+    posix_spawn_file_actions_t actions{};
+    posix_spawn_file_actions_init(&actions);
+    posix_spawnattr_t attributes{};
+    posix_spawnattr_init(&attributes);
+    const auto cleanup = [&]() noexcept {
+        posix_spawnattr_destroy(&attributes);
+        posix_spawn_file_actions_destroy(&actions);
+    };
+    if (const int result = posix_spawn_file_actions_addchdir_np(&actions, workingDirectory.c_str()); result != 0) {
+        cleanup();
+        throw std::runtime_error(std::format("Failed to set the SysDVR bridge working directory: {}", std::strerror(result)));
+    }
+    // Own process group, like CREATE_NEW_PROCESS_GROUP: terminal Ctrl+C reaches
+    // only NexusStream60, which then stops the bridge itself.
+    posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP);
+    posix_spawnattr_setpgroup(&attributes, 0);
+    pid_t pid{};
+    const int result = ::posix_spawn(&pid, executable.c_str(), &actions, &attributes, argv.data(), environ);
+    cleanup();
+    if (result != 0) {
+        throw std::runtime_error(std::format("Failed to launch SysDVR bridge: {}", std::strerror(result)));
+    }
+
+    Log::info("Launched SysDVR bridge with socket " + config.pipeName);
+    return BridgeProcess(pid);
 }
 #endif
 } // namespace

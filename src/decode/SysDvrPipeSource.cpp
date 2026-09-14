@@ -14,6 +14,14 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <cerrno>
+#include <cstdlib>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/un.h>
+#include <unistd.h>
 #endif
 
 namespace ns60 {
@@ -37,6 +45,19 @@ std::wstring pipePathFor(std::string_view name) {
     if (name.starts_with(prefix)) return widen(name);
     return std::wstring(LR"(\\.\pipe\)") + widen(name);
 }
+#else
+static_assert(sizeof(sockaddr_un{}.sun_path) > sysdvr_bridge::MaxUnixSocketPathSize);
+
+std::string posixError(int code) {
+    return std::format("errno {} ({})", code, std::strerror(code));
+}
+
+// Mirrors .NET's Path.GetTempPath() on Unix, which the bridge's
+// NamedPipeClientStream uses to place relative pipe names.
+std::string dotnetTempDirectory() {
+    const char* value = std::getenv("TMPDIR");
+    return value && *value ? std::string(value) : std::string("/tmp/");
+}
 #endif
 } // namespace
 
@@ -50,7 +71,13 @@ struct SysDvrPipeSource::Impl {
         if (pipe == INVALID_HANDLE_VALUE) throw std::runtime_error("Failed to create SysDVR pipe '" + name + "': " + win32Error(GetLastError()));
         Log::info("Waiting for SysDVR-UpscalerBridge on pipe " + name);
 #else
-        throw std::runtime_error("SysDVR named-pipe input is only available on Windows");
+        try {
+            openListener();
+        } catch (...) {
+            closeSockets();
+            throw;
+        }
+        Log::info("Waiting for SysDVR-UpscalerBridge on socket " + socketPath);
 #endif
     }
 
@@ -60,6 +87,8 @@ struct SysDvrPipeSource::Impl {
             DisconnectNamedPipe(pipe);
             CloseHandle(pipe);
         }
+#else
+        closeSockets();
 #endif
     }
 
@@ -75,6 +104,12 @@ struct SysDvrPipeSource::Impl {
     bool eof{};
 #ifdef _WIN32
     HANDLE pipe{INVALID_HANDLE_VALUE};
+#else
+    // .NET's NamedPipeClientStream is a Unix domain socket client on macOS.
+    std::string socketPath;
+    int listener{-1};
+    int connection{-1};
+    bool socketBound{};
 #endif
 
     int read(std::uint8_t* destination, int destinationSize) {
@@ -103,10 +138,21 @@ struct SysDvrPipeSource::Impl {
             const DWORD error = GetLastError();
             if (error != ERROR_PIPE_CONNECTED) throw std::runtime_error("SysDVR pipe connection failed: " + win32Error(error));
         }
-        connected = true;
         Log::info("SysDVR-UpscalerBridge connected to pipe " + name);
-        readHello();
+#else
+        int client{-1};
+        do {
+            client = ::accept(listener, nullptr, nullptr);
+        } while (client < 0 && errno == EINTR);
+        if (client < 0) {
+            const int error = errno;
+            throw std::runtime_error("SysDVR socket accept failed: " + posixError(error));
+        }
+        connection = client;
+        Log::info("SysDVR-UpscalerBridge connected to socket " + socketPath);
 #endif
+        connected = true;
+        readHello();
     }
 
     void readHello() {
@@ -195,11 +241,72 @@ struct SysDvrPipeSource::Impl {
         }
         return true;
 #else
-        (void)destination;
-        (void)byteCount;
-        return false;
+        std::size_t total{};
+        while (total < byteCount) {
+            const ssize_t bytesRead = ::read(connection, destination + total, byteCount - total);
+            if (bytesRead < 0) {
+                const int error = errno;
+                if (error == EINTR) continue;
+                if (error == ECONNRESET) return false;
+                throw std::runtime_error("SysDVR socket read failed: " + posixError(error));
+            }
+            if (bytesRead == 0) return false;
+            total += static_cast<std::size_t>(bytesRead);
+        }
+        return true;
 #endif
     }
+
+#ifndef _WIN32
+    void openListener() {
+        socketPath = sysdvr_bridge::unixSocketPathFor(name, dotnetTempDirectory());
+        struct stat existing {};
+        if (::lstat(socketPath.c_str(), &existing) == 0) {
+            if (!S_ISSOCK(existing.st_mode)) {
+                throw std::runtime_error("Refusing to replace a non-socket file at SysDVR socket path " + socketPath);
+            }
+            // A previous run that did not shut down cleanly leaves its socket file behind.
+            ::unlink(socketPath.c_str());
+        }
+
+        listener = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (listener < 0) {
+            const int error = errno;
+            throw std::runtime_error("Failed to create SysDVR socket: " + posixError(error));
+        }
+        sockaddr_un address{};
+        address.sun_family = AF_UNIX;
+        std::memcpy(address.sun_path, socketPath.c_str(), socketPath.size() + 1);
+        if (::bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+            const int error = errno;
+            throw std::runtime_error("Failed to bind SysDVR socket '" + socketPath + "': " + posixError(error));
+        }
+        socketBound = true;
+        if (::chmod(socketPath.c_str(), S_IRUSR | S_IWUSR) != 0) {
+            const int error = errno;
+            throw std::runtime_error("Failed to restrict SysDVR socket permissions: " + posixError(error));
+        }
+        if (::listen(listener, 1) != 0) {
+            const int error = errno;
+            throw std::runtime_error("Failed to listen on SysDVR socket: " + posixError(error));
+        }
+    }
+
+    void closeSockets() noexcept {
+        if (connection >= 0) {
+            ::close(connection);
+            connection = -1;
+        }
+        if (listener >= 0) {
+            ::close(listener);
+            listener = -1;
+        }
+        if (socketBound) {
+            ::unlink(socketPath.c_str());
+            socketBound = false;
+        }
+    }
+#endif
 };
 
 SysDvrPipeSource::SysDvrPipeSource(std::string pipeName) : impl_(std::make_unique<Impl>(std::move(pipeName))) {}

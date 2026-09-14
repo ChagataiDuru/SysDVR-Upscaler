@@ -15,7 +15,8 @@
       "environment": {
         "VCPKG_ROOT": "$penv{VCPKG_ROOT}"
       },
-      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
     },
     {
       "name": "win-debug",
@@ -38,19 +39,65 @@
         "NS60_BUILD_APP": "OFF",
         "NS60_BUILD_TESTS": "ON"
       }
+    },
+    {
+      "name": "macos-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_CXX_STANDARD": "20",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_OSX_ARCHITECTURES": "arm64",
+        "VCPKG_TARGET_TRIPLET": "arm64-osx"
+      },
+      "environment": {
+        "VCPKG_ROOT": "$penv{VCPKG_ROOT}"
+      },
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" }
+    },
+    {
+      "name": "mac-debug",
+      "inherits": "macos-base",
+      "displayName": "macOS arm64 Debug",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "NS60_ENABLE_VALIDATION": "ON" }
+    },
+    {
+      "name": "mac-release",
+      "inherits": "macos-base",
+      "displayName": "macOS arm64 Release",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "NS60_ENABLE_VALIDATION": "OFF" }
+    },
+    {
+      "name": "mac-core-tests",
+      "inherits": "macos-base",
+      "displayName": "Dependency-light core tests (macOS)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "NS60_BUILD_APP": "OFF",
+        "NS60_BUILD_TESTS": "ON"
+      }
     }
   ],
   "buildPresets": [
     { "name": "win-debug", "configurePreset": "win-debug" },
     { "name": "win-release", "configurePreset": "win-release" },
-    { "name": "core-tests", "configurePreset": "core-tests" }
+    { "name": "core-tests", "configurePreset": "core-tests" },
+    { "name": "mac-debug", "configurePreset": "mac-debug" },
+    { "name": "mac-release", "configurePreset": "mac-release" },
+    { "name": "mac-core-tests", "configurePreset": "mac-core-tests" }
   ],
   "testPresets": [
     {
       "name": "core-tests",
       "configurePreset": "core-tests",
       "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "mac-core-tests",
+      "configurePreset": "mac-core-tests",
+      "output": { "outputOnFailure": true }
     }
   ]
 }
-

@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 
 namespace {
 void writeLe16(std::array<std::uint8_t, ns60::sysdvr_bridge::HelloHeaderSize>& data, std::size_t offset, std::uint16_t value) {
@@ -83,4 +84,20 @@ TEST_CASE("SysDVR bridge stream parser rejects oversized payloads") {
     auto data = validStream();
     writeLe32(data, 16, ns60::sysdvr_bridge::MaxPayloadSize + 1);
     CHECK_THROWS((void)ns60::sysdvr_bridge::parseStreamHeader(data));
+}
+
+TEST_CASE("SysDVR bridge Unix socket path mirrors .NET named-pipe placement") {
+    using ns60::sysdvr_bridge::unixSocketPathFor;
+    CHECK(unixSocketPathFor("SysDVR-Upscaler.Video", "/var/folders/ab/T/") == "/var/folders/ab/T/CoreFxPipe_SysDVR-Upscaler.Video");
+    CHECK(unixSocketPathFor("SysDVR-Upscaler.Video", "/tmp") == "/tmp/CoreFxPipe_SysDVR-Upscaler.Video");
+    CHECK(unixSocketPathFor("/tmp/ns60-42-7.sock", "/ignored/") == "/tmp/ns60-42-7.sock");
+}
+
+TEST_CASE("SysDVR bridge Unix socket path rejects invalid names and oversized paths") {
+    using ns60::sysdvr_bridge::unixSocketPathFor;
+    CHECK_THROWS((void)unixSocketPathFor("", "/tmp/"));
+    CHECK_THROWS((void)unixSocketPathFor("nested/name", "/tmp/"));
+    CHECK_THROWS((void)unixSocketPathFor("name", ""));
+    CHECK_THROWS((void)unixSocketPathFor("/" + std::string(ns60::sysdvr_bridge::MaxUnixSocketPathSize, 'x'), "/tmp/"));
+    CHECK_NOTHROW((void)unixSocketPathFor("/" + std::string(ns60::sysdvr_bridge::MaxUnixSocketPathSize - 1, 'x'), "/tmp/"));
 }

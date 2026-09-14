@@ -1,8 +1,11 @@
 #include "app/AppConfig.h"
 
+#include <cerrno>
 #include <charconv>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
+#include <string>
 
 namespace ns60 {
 namespace {
@@ -22,8 +25,17 @@ bool parseNonNegativeInt(std::string_view text, int& value) {
 }
 
 bool parseUnitFloat(std::string_view text, float& value) {
+#ifdef __APPLE__
+    // libc++ floating-point std::from_chars requires macOS 26. strtof in the C locale matches it
+    // once the input is restricted to plain decimal notation without a leading '+'.
+    if(text.empty()||text.front()=='+'||text.find_first_not_of("0123456789.+-eE")!=std::string_view::npos) return false;
+    const std::string owned(text); char* end{}; errno=0;
+    const float parsed=std::strtof(owned.c_str(),&end);
+    if(errno==ERANGE||end!=owned.c_str()+owned.size()||!validSharpness(parsed)) return false; value=parsed; return true;
+#else
     float parsed{}; const auto [end,error]=std::from_chars(text.data(),text.data()+text.size(),parsed);
     if(error!=std::errc{}||end!=text.data()+text.size()||!validSharpness(parsed)) return false; value=parsed; return true;
+#endif
 }
 std::optional<bool> parseBoolean(std::string_view text) { if(text=="on") return true; if(text=="off") return false; return std::nullopt; }
 std::optional<LogLevel> parseLogLevel(std::string_view text) {
@@ -46,6 +58,7 @@ std::optional<LatencyProfile> parseLatencyProfile(std::string_view text) {
 std::optional<DecoderBackend> parseDecoderBackend(std::string_view text) {
     if(text=="software"||text=="sw") return DecoderBackend::Software;
     if(text=="d3d11va"||text=="d3d11") return DecoderBackend::D3D11VA;
+    if(text=="videotoolbox"||text=="vt") return DecoderBackend::VideoToolbox;
     if(text=="auto") return DecoderBackend::Auto;
     return std::nullopt;
 }
@@ -139,7 +152,7 @@ ParseResult parseCommandLine(const std::vector<std::string>& args, bool defaultV
         else if(argument=="--upscaler-pipe-queue-messages") { const auto* value=requireValue(argument);int parsed{};if(!value||!parseIntInRange(*value,parsed,1,1024))return{ParseAction::Run,std::nullopt,"--upscaler-pipe-queue-messages requires an integer in [1, 1024]"};config.bridgePipeQueueMessages=parsed; }
         else if(argument=="--upscaler-pipe-queue-bytes") { const auto* value=requireValue(argument);int parsed{};if(!value||!parseIntInRange(*value,parsed,64*1024,64*1024*1024))return{ParseAction::Run,std::nullopt,"--upscaler-pipe-queue-bytes requires an integer in [65536, 67108864]"};config.bridgePipeQueueBytes=parsed; }
         else if(argument=="--upscaler-pipe-max-age-ms") { const auto* value=requireValue(argument);int parsed{};if(!value||!parseIntInRange(*value,parsed,1,1000))return{ParseAction::Run,std::nullopt,"--upscaler-pipe-max-age-ms requires an integer in [1, 1000]"};config.bridgePipeMaxAgeMs=parsed; }
-        else if(argument=="--decoder"||argument=="--decoder-backend") { const auto* value=requireValue(argument);const auto parsed=value?parseDecoderBackend(*value):std::nullopt;if(!parsed)return{ParseAction::Run,std::nullopt,"--decoder requires software, d3d11va, or auto"};config.decoderBackend=*parsed; }
+        else if(argument=="--decoder"||argument=="--decoder-backend") { const auto* value=requireValue(argument);const auto parsed=value?parseDecoderBackend(*value):std::nullopt;if(!parsed)return{ParseAction::Run,std::nullopt,"--decoder requires software, d3d11va, videotoolbox, or auto"};config.decoderBackend=*parsed; }
         else if(argument=="--decoder-path") { const auto* value=requireValue(argument);const auto parsed=value?parseDecoderPath(*value):std::nullopt;if(!parsed)return{ParseAction::Run,std::nullopt,"--decoder-path requires readback, interop, or interop-copy"};config.decoderPath=*parsed; }
         else if(argument=="--quality-preset") { const auto* value=requireValue(argument); if(!value||!applyQualityPreset(*value,config))return{ParseAction::Run,std::nullopt,"--quality-preset requires balanced, performance, or quality"}; }
         else if(argument=="--width"||argument=="--height") { const auto* value=requireValue(argument);int parsed{};if(!value||!parsePositiveInt(*value,parsed))return{ParseAction::Run,std::nullopt,argument+" requires an integer in [1, 16384]"};(argument=="--width"?config.outputWidth:config.outputHeight)=parsed; }
@@ -169,14 +182,15 @@ ParseResult parseCommandLine(const std::vector<std::string>& args, bool defaultV
 std::string commandLineHelp() { return R"(NexusStream60 - offline and live SysDVR Vulkan upscaling laboratory
 
 Usage:
-  NexusStream60.exe --input <video.mp4> [options]
-  NexusStream60.exe --source sysdvr-pipe --pipe-name <name> [options]
-  NexusStream60.exe --source sysdvr --sysdvr-bridge <SysDVR-Client.exe> [options]
+  NexusStream60 --input <video.mp4> [options]
+  NexusStream60 --source sysdvr-pipe --pipe-name <name> [options]
+  NexusStream60 --source sysdvr --sysdvr-bridge <SysDVR-Client executable> [options]
 
 Input options:
   --source <mode>             file|sysdvr-pipe|sysdvr (default file)
   --input <path>              Input MP4 for file mode (a positional path is also accepted)
-  --pipe-name <name>          Named pipe for sysdvr-pipe mode (default SysDVR-Upscaler.Video)
+  --pipe-name <name>          Bridge pipe for sysdvr-pipe mode: a Windows named pipe, or on macOS a Unix
+                              socket name or absolute path (default SysDVR-Upscaler.Video)
   --sysdvr-bridge <path>      SysDVR-Client executable for unified sysdvr mode
   --latency-profile <profile> quality|balanced|ultra live buffering preset (default balanced)
   --live-frame-queue-depth <n> Live decoded queue depth in [1,3] (default 1)

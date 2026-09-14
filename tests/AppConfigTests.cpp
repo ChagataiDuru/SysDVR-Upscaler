@@ -77,7 +77,7 @@ TEST_CASE("CLI parses SysDVR pipe source") {
 }
 
 TEST_CASE("CLI parses unified SysDVR launch") {
-    const auto result = ns60::parseCommandLine({"app", "--source", "sysdvr", "--sysdvr-bridge", ".\\artifacts\\sysdvr-upscaler-bridge\\win-x64\\SysDVR-Client.exe",
+    const auto result = ns60::parseCommandLine({"app", "--source", "sysdvr", "--sysdvr-bridge", "./artifacts/sysdvr-upscaler-bridge/win-x64/SysDVR-Client.exe",
         "--quality-preset", "balanced", "--fullscreen", "--borderless"}, false);
     REQUIRE(result.config);
     CHECK(static_cast<int>(result.config->source) == static_cast<int>(ns60::SourceKind::SysDvr));
@@ -158,4 +158,22 @@ TEST_CASE("CLI parses explicit D3D11 Vulkan GPU-copy interop") {
 
     CHECK_FALSE(ns60::parseCommandLine({"app", "--input", "x.mp4", "--decoder-path", "interop-copy"}, false).config);
     CHECK_FALSE(ns60::parseCommandLine({"app", "--input", "x.mp4", "--decoder", "auto", "--decoder-path", "interop-copy"}, false).config);
+}
+
+TEST_CASE("CLI parses VideoToolbox decoder backend") {
+    const auto result = ns60::parseCommandLine({"app", "--input", "x.mp4", "--decoder", "videotoolbox"}, false);
+    REQUIRE(result.config);
+    CHECK(static_cast<int>(result.config->decoderBackend) == static_cast<int>(ns60::DecoderBackend::VideoToolbox));
+    CHECK(static_cast<int>(result.config->decoderPath) == static_cast<int>(ns60::DecoderPath::Readback));
+
+    const auto alias = ns60::parseCommandLine({"app", "--source", "sysdvr-pipe", "--decoder", "vt"}, false);
+    REQUIRE(alias.config);
+    CHECK(static_cast<int>(alias.config->decoderBackend) == static_cast<int>(ns60::DecoderBackend::VideoToolbox));
+
+    CHECK(ns60::isHardwareBackend(ns60::DecoderBackend::VideoToolbox));
+    CHECK(ns60::isHardwareBackend(ns60::DecoderBackend::D3D11VA));
+    CHECK_FALSE(ns60::isHardwareBackend(ns60::DecoderBackend::Software));
+    CHECK_FALSE(ns60::isHardwareBackend(ns60::DecoderBackend::Auto));
+
+    CHECK_FALSE(ns60::parseCommandLine({"app", "--input", "x.mp4", "--decoder", "videotoolbox", "--decoder-path", "interop-copy"}, false).config);
 }

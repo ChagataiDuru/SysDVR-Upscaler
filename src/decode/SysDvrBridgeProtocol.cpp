@@ -103,6 +103,28 @@ StreamMessageHeader parseStreamHeader(std::span<const std::uint8_t> header) {
     return parsed;
 }
 
+std::string unixSocketPathFor(std::string_view pipeName, std::string_view tempDirectory) {
+    if (pipeName.empty()) throw std::invalid_argument("SysDVR pipe name cannot be empty");
+    std::string path;
+    if (pipeName.front() == '/') {
+        path = pipeName;
+    } else {
+        if (pipeName.find('/') != std::string_view::npos) {
+            throw std::invalid_argument(std::format("SysDVR pipe name '{}' must be a plain name or an absolute socket path", pipeName));
+        }
+        if (tempDirectory.empty()) throw std::invalid_argument("A temporary directory is required for a relative SysDVR pipe name");
+        path = tempDirectory;
+        if (path.back() != '/') path.push_back('/');
+        path += "CoreFxPipe_";
+        path += pipeName;
+    }
+    if (path.size() > MaxUnixSocketPathSize) {
+        throw std::runtime_error(std::format("SysDVR socket path is {} bytes, above the Unix limit of {}: {}",
+            path.size(), MaxUnixSocketPathSize, path));
+    }
+    return path;
+}
+
 const char* messageTypeName(MessageType type) noexcept {
     switch (type) {
     case MessageType::VideoPayload: return "VideoPayload";

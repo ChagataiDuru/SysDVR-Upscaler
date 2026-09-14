@@ -36,6 +36,22 @@ bool hasLayer(const char* name) {
     return std::any_of(layers.begin(), layers.end(), [name](const auto& layer) { return std::strcmp(layer.layerName, name) == 0; });
 }
 
+// MoltenVK is a portability driver, which the loader only enumerates when the
+// application opts in. Other platforms keep their validated device enumeration.
+bool portabilityEnumerationAvailable() {
+#ifdef __APPLE__
+    std::uint32_t count{};
+    vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr);
+    std::vector<VkExtensionProperties> extensions(count);
+    vkEnumerateInstanceExtensionProperties(nullptr, &count, extensions.data());
+    return std::any_of(extensions.begin(), extensions.end(), [](const auto& value) {
+        return std::strcmp(value.extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0;
+    });
+#else
+    return false;
+#endif
+}
+
 bool hasDeviceExtension(VkPhysicalDevice device, const char* name) {
     std::uint32_t count{};
     vkEnumerateDeviceExtensionProperties(device, nullptr, &count, nullptr);
@@ -147,6 +163,8 @@ void VulkanContext::createInstance() {
     if (!glfwExtensions || glfwCount == 0) throw std::runtime_error("GLFW did not report required Vulkan surface extensions");
     std::vector<const char*> extensions(glfwExtensions, glfwExtensions + glfwCount);
     if (validationEnabled_) extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    const bool portabilityEnumeration = portabilityEnumerationAvailable();
+    if (portabilityEnumeration) extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
 
     const VkApplicationInfo application{VK_STRUCTURE_TYPE_APPLICATION_INFO, nullptr, "NexusStream60", VK_MAKE_VERSION(0, 1, 0),
         "NexusStream60", VK_MAKE_VERSION(0, 1, 0), VK_API_VERSION_1_2};
@@ -159,6 +177,7 @@ void VulkanContext::createInstance() {
     create.pApplicationInfo = &application;
     create.enabledExtensionCount = static_cast<std::uint32_t>(extensions.size());
     create.ppEnabledExtensionNames = extensions.data();
+    if (portabilityEnumeration) create.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
     if (validationEnabled_) {
         create.enabledLayerCount = static_cast<std::uint32_t>(validationLayers.size());
         create.ppEnabledLayerNames = validationLayers.data();
@@ -274,6 +293,9 @@ void VulkanContext::createDevice() {
 #endif
     }
     if (requireYcbcrImageArrays_) extensions.push_back(VK_EXT_YCBCR_IMAGE_ARRAYS_EXTENSION_NAME);
+    // The spec requires enabling VK_KHR_portability_subset whenever a device (e.g. MoltenVK) advertises it.
+    constexpr const char* portabilitySubset = "VK_KHR_portability_subset";
+    if (hasDeviceExtension(physicalDevice_, portabilitySubset)) extensions.push_back(portabilitySubset);
     VkPhysicalDeviceFeatures features{};
     features.shaderStorageImageExtendedFormats = VK_TRUE;
     VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcrConversion{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES};
@@ -296,7 +318,13 @@ void VulkanContext::createDevice() {
     vkGetDeviceQueue(device_, graphicsFamily_, 0, &graphicsQueue_);
     nameObject(VK_OBJECT_TYPE_DEVICE, reinterpret_cast<std::uint64_t>(device_), "NexusStream60 logical device");
     Log::info(std::format("Vulkan loader/device API: {} / {}", apiVersion(VK_API_VERSION_1_2), apiVersion(properties_.apiVersion)));
-    Log::info(std::format("Selected GPU: {} (driver {}, timestamp period {:.3f} ns)", gpuName_, properties_.driverVersion, properties_.limits.timestampPeriod));
+    VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 driverQuery{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    driverQuery.pNext = &driver;
+    vkGetPhysicalDeviceProperties2(physicalDevice_, &driverQuery);
+    Log::info(std::format("Selected GPU: {} (driver {} {} / {}, timestamp period {:.3f} ns)", gpuName_,
+        static_cast<const char*>(driver.driverName), static_cast<const char*>(driver.driverInfo),
+        properties_.driverVersion, properties_.limits.timestampPeriod));
     Log::info(std::format("Graphics/compute/present queue family: {}", graphicsFamily_));
     if (hasDeviceExtension(physicalDevice_, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME))
         Log::debug("VK_KHR_synchronization2 is available; Phase 1 uses explicit legacy barriers for Vulkan 1.2 portability");

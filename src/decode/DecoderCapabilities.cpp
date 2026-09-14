@@ -67,6 +67,8 @@ struct VulkanDeviceSummary {
     std::string apiVersion;
     std::uint32_t apiVersionValue{};
     std::uint32_t driverVersion{};
+    std::string driverName;
+    bool portabilitySubset{};
     bool supportsTimestamp{};
     bool hasGraphicsComputeQueue{};
     bool supportsRgba16StorageSampled{};
@@ -192,6 +194,21 @@ FFmpegDeviceStatus queryFFmpegDevice(AVHWDeviceType type) {
     }
     av_buffer_unref(&device);
     return status;
+}
+
+// Matches VulkanContext: only macOS opts into portability drivers such as MoltenVK.
+bool portabilityEnumerationAvailable() {
+#ifdef __APPLE__
+    std::uint32_t count{};
+    if (vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr) != VK_SUCCESS) return false;
+    std::vector<VkExtensionProperties> properties(count);
+    if (count != 0 && vkEnumerateInstanceExtensionProperties(nullptr, &count, properties.data()) != VK_SUCCESS) return false;
+    return std::any_of(properties.begin(), properties.end(), [](const VkExtensionProperties& property) {
+        return std::string_view(property.extensionName) == VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+    });
+#else
+    return false;
+#endif
 }
 
 bool hasExtension(const std::vector<std::string>& extensions, std::string_view name) {
@@ -330,6 +347,13 @@ VulkanAudit queryVulkanAudit(const LuidSummary* requiredLuid) {
         "NexusStream60", VK_MAKE_VERSION(0, 1, 0), requestedApi};
     VkInstanceCreateInfo create{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     create.pApplicationInfo = &application;
+    std::vector<const char*> instanceExtensions;
+    if (portabilityEnumerationAvailable()) {
+        instanceExtensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+        create.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    }
+    create.enabledExtensionCount = static_cast<std::uint32_t>(instanceExtensions.size());
+    create.ppEnabledExtensionNames = instanceExtensions.data();
     VkInstance instance{};
     VkResult result = vkCreateInstance(&create, nullptr, &instance);
     if (result != VK_SUCCESS) {
@@ -365,10 +389,14 @@ VulkanAudit queryVulkanAudit(const LuidSummary* requiredLuid) {
         VkPhysicalDeviceProperties properties{};
         if (getProperties2) {
             VkPhysicalDeviceIDProperties idProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+            VkPhysicalDeviceDriverProperties driverProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+            idProperties.pNext = &driverProperties;
             VkPhysicalDeviceProperties2 properties2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
             properties2.pNext = &idProperties;
             getProperties2(physicalDevice, &properties2);
             properties = properties2.properties;
+            device.driverName = std::format("{} {}", static_cast<const char*>(driverProperties.driverName),
+                                            static_cast<const char*>(driverProperties.driverInfo));
             if (idProperties.deviceLUIDValid == VK_TRUE) {
                 device.luid.valid = true;
                 std::memcpy(device.luid.bytes.data(), idProperties.deviceLUID, device.luid.bytes.size());
@@ -386,6 +414,7 @@ VulkanAudit queryVulkanAudit(const LuidSummary* requiredLuid) {
         device.hasGraphicsComputeQueue = hasGraphicsComputeQueue(physicalDevice);
         device.supportsRgba16StorageSampled = supportsRgba16StorageSampled(physicalDevice);
         const auto extensions = enumerateDeviceExtensions(physicalDevice);
+        device.portabilitySubset = hasExtension(extensions, "VK_KHR_portability_subset");
         device.ycbcrImageArraysExtension = hasExtension(extensions, VK_EXT_YCBCR_IMAGE_ARRAYS_EXTENSION_NAME);
         VkPhysicalDeviceYcbcrImageArraysFeaturesEXT ycbcrArrays{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_YCBCR_IMAGE_ARRAYS_FEATURES_EXT};
         VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcrConversion{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES};
@@ -451,11 +480,9 @@ std::string featureLevelName(D3D_FEATURE_LEVEL level) {
     default: return "unknown";
     }
 }
-#endif
 
 D3D11AdapterSummary queryD3D11DefaultAdapter() {
     D3D11AdapterSummary summary;
-#ifdef _WIN32
     constexpr std::array requestedLevels{D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_11_1,
         D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
     Microsoft::WRL::ComPtr<ID3D11Device> device;
@@ -493,9 +520,6 @@ D3D11AdapterSummary queryD3D11DefaultAdapter() {
     summary.featureLevel = featureLevelName(selectedLevel);
     summary.luid.valid = true;
     std::memcpy(summary.luid.bytes.data(), &description.AdapterLuid, summary.luid.bytes.size());
-#else
-    summary.error = "D3D11 is only available on Windows";
-#endif
     return summary;
 }
 
@@ -506,6 +530,7 @@ std::string sameGpuText(const D3D11AdapterSummary& d3d11, const VulkanAudit& vul
     if (!selected.luid.valid) return "unknown (Vulkan LUID unavailable)";
     return d3d11.luid.bytes == selected.luid.bytes ? "yes" : "no";
 }
+#endif
 
 void appendCodecInventory(std::ostringstream& output, const AVCodec* h264Decoder) {
     if (!h264Decoder) {
@@ -540,10 +565,14 @@ void appendVulkanAudit(std::ostringstream& output, const VulkanAudit& vulkan) {
     const auto& device = vulkan.devices[*vulkan.selectedIndex];
     output << "Selected Vulkan device: " << device.name << " (" << device.type << ")\n";
     output << "Vulkan device API/driver: " << device.apiVersion << " / " << device.driverVersion << "\n";
+    output << "Vulkan driver: "
+           << (device.driverName.find_first_not_of(' ') == std::string::npos ? std::string("unavailable") : device.driverName)
+           << ", portability subset=" << yesNo(device.portabilitySubset) << "\n";
     output << "Vulkan device LUID: " << formatLuid(device.luid) << "\n";
     output << "Renderer baseline features: timestamp=" << yesNo(device.supportsTimestamp)
            << ", graphics+compute=" << yesNo(device.hasGraphicsComputeQueue)
            << ", RGBA16F sampled/storage=" << yesNo(device.supportsRgba16StorageSampled) << "\n";
+#ifdef _WIN32
     output << "External memory extensions: core=" << yesNo(device.externalMemory)
            << ", win32=" << yesNo(device.externalMemoryWin32) << "\n";
     output << "D3D11 texture import: rgba8=" << yesNo(device.d3d11TextureImportRgba8)
@@ -561,6 +590,14 @@ void appendVulkanAudit(std::ostringstream& output, const VulkanAudit& vulkan) {
     output << "Strict D3D11/Vulkan zero-copy: unsupported on the tested NVIDIA driver (imported multi-planar NV12 fault)\n";
     output << "Selected production interop strategy: interop-copy (GPU-resident R8/R8G8 shared planes)\n";
     output << "Actual decoder texture import: not attempted (run an H.264 stream with --decoder d3d11va --decoder-path interop-copy)\n";
+#endif
+}
+
+void appendFFmpegDevice(std::ostringstream& output, std::string_view label, const FFmpegDeviceStatus& status) {
+    output << label << " FFmpeg device: " << (status.available ? "available" : "unavailable") << "\n";
+    if (!status.available) output << label << " error: " << status.error << "\n";
+    output << label << " hardware output formats: " << join(status.validHwFormats, ", ") << "\n";
+    output << label << " software transfer formats: " << join(status.validSwFormats, ", ") << "\n";
 }
 } // namespace
 
@@ -579,9 +616,16 @@ std::string decoderListReport() {
 std::string decoderCapabilitiesReport() {
     const auto versions = ffmpegVersions();
     const AVCodec* h264Decoder = avcodec_find_decoder(AV_CODEC_ID_H264);
+#ifdef _WIN32
     const auto d3d11va = queryFFmpegDevice(AV_HWDEVICE_TYPE_D3D11VA);
     const auto d3d11 = queryD3D11DefaultAdapter();
     const auto vulkan = queryVulkanAudit(d3d11.available ? &d3d11.luid : nullptr);
+#else
+    const auto vulkan = queryVulkanAudit(nullptr);
+#endif
+#ifdef __APPLE__
+    const auto videotoolbox = queryFFmpegDevice(AV_HWDEVICE_TYPE_VIDEOTOOLBOX);
+#endif
 
     std::ostringstream output;
     output << "NexusStream60 Phase 3 decoder capability report\n";
@@ -589,10 +633,8 @@ std::string decoderCapabilitiesReport() {
            << ", avutil " << versions.avutil << "\n";
     output << "FFmpeg hardware device types: " << join(compiledHardwareDeviceTypes(), ", ") << "\n";
     appendCodecInventory(output, h264Decoder);
-    output << "D3D11VA FFmpeg device: " << (d3d11va.available ? "available" : "unavailable") << "\n";
-    if (!d3d11va.available) output << "D3D11VA error: " << d3d11va.error << "\n";
-    output << "D3D11VA hardware output formats: " << join(d3d11va.validHwFormats, ", ") << "\n";
-    output << "D3D11VA software transfer formats: " << join(d3d11va.validSwFormats, ", ") << "\n";
+#ifdef _WIN32
+    appendFFmpegDevice(output, "D3D11VA", d3d11va);
 
     output << "D3D11 default adapter: ";
     if (d3d11.available) {
@@ -601,10 +643,22 @@ std::string decoderCapabilitiesReport() {
     } else {
         output << "unavailable (" << d3d11.error << ")\n";
     }
+#endif
+#ifdef __APPLE__
+    appendFFmpegDevice(output, "VideoToolbox", videotoolbox);
+#endif
 
     appendVulkanAudit(output, vulkan);
+#ifdef _WIN32
     output << "D3D11/Vulkan same GPU: " << sameGpuText(d3d11, vulkan) << "\n";
     output << "Runtime decoder backends: software, d3d11va, auto (select with --decoder)\n";
+#elif defined(__APPLE__)
+    output << "D3D11VA and D3D11/Vulkan interop: Windows only\n";
+    output << "Runtime decoder backends: software, videotoolbox (readback), auto (select with --decoder)\n";
+#else
+    output << "D3D11VA and D3D11/Vulkan interop: Windows only\n";
+    output << "Runtime decoder backends: software, auto (select with --decoder)\n";
+#endif
     return output.str();
 }
 

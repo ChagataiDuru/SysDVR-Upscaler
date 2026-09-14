@@ -1,8 +1,8 @@
 # SysDVR-Upscaler
 
-SysDVR-Upscaler is a Windows-first C++20/Vulkan client for low-latency Nintendo Switch SysDVR video. It accepts recorded H.264 captures or a live SysDVR bridge stream, performs explicit YUV color reconstruction, and compares spatial upscalers before presentation.
+SysDVR-Upscaler is a C++20/Vulkan client for low-latency Nintendo Switch SysDVR video on Windows and macOS (Apple Silicon). It accepts recorded H.264 captures or a live SysDVR bridge stream, performs explicit YUV color reconstruction, and compares spatial upscalers before presentation.
 
-The current implementation includes software decode, optional FFmpeg D3D11VA decode, direct CPU-NV12 upload into Vulkan, a validated GPU-resident D3D11/Vulkan interop-copy path, eight upscaling modes, split comparison, timing telemetry, and screenshots. Strict imported-NV12 zero-copy is intentionally unavailable on the tested NVIDIA driver.
+The current implementation includes software decode, optional FFmpeg D3D11VA decode on Windows, FFmpeg VideoToolbox decode with CPU readback on macOS, direct CPU-NV12 upload into Vulkan, a validated GPU-resident D3D11/Vulkan interop-copy path on Windows, eight upscaling modes, split comparison, timing telemetry, and screenshots. Strict imported-NV12 zero-copy is intentionally unavailable on the tested NVIDIA driver.
 
 ## Milestone status
 
@@ -15,8 +15,9 @@ The current implementation includes software decode, optional FFmpeg D3D11VA dec
 | Phase 3.1: D3D11VA decode with CPU readback | Implemented |
 | Phase 3.2: native CPU-NV12 Vulkan upload | Implemented; manual hardware comparison remains pending |
 | Phase 3.3: D3D11/Vulkan NV12 interop | Closed with `interop-copy`: pixel-exact on all three recorded samples and faster than readback; strict imported-NV12 zero-copy is unsupported on NVIDIA 616.92; Switch hardware acceptance pending |
+| Phase 4.0: macOS (Apple Silicon) port with VideoToolbox readback | Implemented; live Switch USB sessions ran on an Apple M2 with software and VideoToolbox decode (Debug, validation clean); USB reconnect, visual comparison, and the 30-minute soak remain pending |
 
-Do not treat the Phase 2 or Phase 3 status as a completed hardware-success claim. USB disconnect/reconnect, visual comparison, and a 30-minute live soak still need to be run on Switch hardware.
+Do not treat the Phase 2, Phase 3, or Phase 4 status as a completed hardware-success claim. USB disconnect/reconnect, visual comparison, and a 30-minute live soak still need to be run on Switch hardware.
 
 ## Windows prerequisites
 
@@ -55,6 +56,38 @@ Build the managed SysDVR bridge separately when using live input:
 .\scripts\build-sysdvr-upscaler-bridge.ps1
 ```
 
+## macOS prerequisites
+
+- Apple Silicon Mac with Xcode Command Line Tools, CMake 3.24+, Ninja, and `pkg-config` (`brew install cmake ninja pkg-config libusb`).
+- [LunarG Vulkan SDK](https://vulkan.lunarg.com/) for MoltenVK, `glslc`, and the validation layer. Source its `setup-env.sh` before configuring.
+- [vcpkg](https://github.com/microsoft/vcpkg) with `VCPKG_ROOT` set. The same manifest builds FFmpeg with VideoToolbox enabled.
+- .NET 9 SDK for the live bridge (.NET 8 is not enough).
+
+See [macOS dependencies](docs/dependencies-macos.md).
+
+## macOS configure, build, and test
+
+```sh
+git clone https://github.com/microsoft/vcpkg ~/vcpkg
+~/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+export VCPKG_ROOT="$HOME/vcpkg"
+source ~/VulkanSDK/<version>/setup-env.sh
+
+cmake --preset mac-release
+cmake --build --preset mac-release
+
+cmake --preset mac-core-tests
+cmake --build --preset mac-core-tests
+ctest --preset mac-core-tests
+```
+
+`mac-debug` enables Vulkan validation by default. The first configure compiles FFmpeg through vcpkg; later presets reuse the binary cache. Build the bridge with:
+
+```sh
+export DOTNET_ROOT="$HOME/.dotnet" PATH="$HOME/.dotnet:$PATH"
+./scripts/build-sysdvr-upscaler-bridge.sh
+```
+
 ## Decoder diagnostics
 
 These commands do not require an input file:
@@ -64,7 +97,11 @@ These commands do not require an input file:
 .\build\win-release\NexusStream60.exe --decoder-capabilities
 ```
 
-The capability report separately shows extension availability, NV12/D3D11-fence feature support, and whether a real decoder texture has been imported. The standalone report cannot perform the last check without an H.264 stream.
+```sh
+./build/mac-release/NexusStream60 --decoder-capabilities
+```
+
+On Windows the capability report separately shows extension availability, NV12/D3D11-fence feature support, and whether a real decoder texture has been imported; the standalone report cannot perform the last check without an H.264 stream. On macOS it reports the VideoToolbox FFmpeg device and its transfer formats, and the selected Vulkan driver with its portability-subset status.
 
 ## Recorded-file playback
 
@@ -75,7 +112,13 @@ The capability report separately shows extension availability, NV12/D3D11-fence 
   --upscale fsr1-easu-rcas --rcas-sharpness 0.25 --loop
 ```
 
-Expected input is even-sized 8-bit H.264 `yuv420p`/`yuvj420p` with supported range and matrix metadata and left-sited chroma. The verified baseline samples are 1280×720, limited-range BT.709 at approximately 59.8–59.9 FPS. File timing uses decoded presentation timestamps rather than assuming 60 Hz.
+```sh
+./build/mac-release/NexusStream60 --input samples/ui_text_720p60.mp4 \
+  --width 1920 --height 1080 --decoder videotoolbox \
+  --upscale fsr1-easu-rcas --rcas-sharpness 0.25 --loop
+```
+
+Expected input is even-sized 8-bit H.264 `yuv420p`/`yuvj420p` with supported range and matrix metadata and left-sited chroma. The verified baseline samples are 1280×720, limited-range BT.709 at approximately 59.8–59.9 FPS. File timing uses decoded presentation timestamps rather than assuming 60 Hz. On Retina displays `--width`/`--height` are framebuffer pixels.
 
 ## Live SysDVR playback
 
@@ -89,6 +132,17 @@ For a unified launch, let NexusStream60 start the bridge and create a unique pip
   --quality-preset balanced --presentation exact `
   --latency-profile balanced --live-frame-queue-depth 1 `
   --fullscreen --borderless
+```
+
+On macOS the bridge connects over a Unix domain socket instead of a named pipe:
+
+```sh
+./build/mac-release/NexusStream60 \
+  --source sysdvr \
+  --sysdvr-bridge artifacts/sysdvr-upscaler-bridge/osx-arm64/SysDVR-Client \
+  --decoder videotoolbox \
+  --quality-preset balanced --presentation exact \
+  --latency-profile balanced --live-frame-queue-depth 1
 ```
 
 For a manual two-process launch, start NexusStream60 first:
@@ -111,11 +165,14 @@ Then start the bridge:
   --upscaler-pipe-max-age-ms 50 --no-audio
 ```
 
+The same two commands work on macOS with `./build/mac-release/NexusStream60 ... --decoder videotoolbox` and `artifacts/sysdvr-upscaler-bridge/osx-arm64/SysDVR-Client usb ...`; both sides resolve `SysDVR-Upscaler.Video` to `$TMPDIR/CoreFxPipe_SysDVR-Upscaler.Video`.
+
 Decoder selection:
 
 - `--decoder software` is the default software H.264 path.
 - `--decoder d3d11va --decoder-path readback` uses hardware decode, CPU NV12 readback, and the Phase 3.2 native NV12 Vulkan upload.
-- `--decoder auto` tries D3D11VA and falls back to software; it continues to use readback.
+- `--decoder videotoolbox` (macOS) uses VideoToolbox hardware decode with the same CPU NV12 readback and upload. An explicit request never falls back to software.
+- `--decoder auto` tries the platform hardware decoder (D3D11VA on Windows, VideoToolbox on macOS) and falls back to software; it continues to use readback.
 - `--decoder d3d11va --decoder-path interop` is reserved for strict imported-NV12 zero-copy and exits with an explanatory unsupported error on the tested NVIDIA path; it never falls back silently.
 - `--decoder d3d11va --decoder-path interop-copy` is the recommended Windows D3D11VA fast path. Frames remain GPU-resident; one D3D11 copy and a plane-split compute pass produce shared R8/R8G8 textures for Vulkan. The portable global default remains `readback`.
 
@@ -123,7 +180,7 @@ Decoder selection:
 
 Available modes are `nearest`, `bilinear`, `bicubic`, `lanczos2`, `bilinear-cas`, `lanczos2-cas`, `fsr1-easu`, and `fsr1-easu-rcas`. EASU/RCAS and standalone CAS use the pinned official AMD FidelityFX FSR1/CAS source under `third_party/fidelityfx-fsr1/`.
 
-Controls: `Space` pause/resume, `Right` step while paused, `Home` restart, `F11` fullscreen, `Tab` telemetry, `S` screenshot, and `Escape` leave fullscreen/exit. Number keys `1`–`8` select upscalers; `C` toggles comparison; `A`/`B` assign its sides; drag with the left mouse button to move the divider; `[`/`]` adjust sharpness; `Z` toggles the zoom inspector.
+Controls: `Space` pause/resume, `Right` step while paused, `Home` restart, `F11` fullscreen (`fn`+`F11` on most Mac keyboards), `Tab` telemetry, `S` screenshot, and `Escape` leave fullscreen/exit. Number keys `1`–`8` select upscalers; `C` toggles comparison; `A`/`B` assign its sides; drag with the left mouse button to move the divider; `[`/`]` adjust sharpness; `Z` toggles the zoom inspector.
 
 Captures and adjacent JSON metadata are written under `captures/`. Use borderless fullscreen for exact 1920×1080 presentation on a 1080p display.
 
@@ -136,15 +193,18 @@ Captures and adjacent JSON metadata are written under `captures/`. Use borderles
 - [Phase 3.1 D3D11VA readback](docs/phase3/d3d11va-readback.md)
 - [Phase 3.2 native NV12 upload](docs/phase3/nv12-vulkan-path.md)
 - [Phase 3.3 D3D11/Vulkan interop](docs/phase3/d3d11-vulkan-interop.md)
+- [Phase 4.0 macOS port](docs/phase4-macos-port.md) and [macOS dependencies](docs/dependencies-macos.md)
 - [Upscaler behavior](docs/upscalers.md), [presentation mapping](docs/presentation-mapping.md), and [telemetry methodology](docs/telemetry-methodology.md)
 
-Direct Vulkan Video H.264 decode is the next true-zero-copy candidate. It requires rebuilding FFmpeg with Vulkan support and is deliberately a separate phase. NVIDIA Image Scaling, compression preprocessing, Nexus Adaptive Detail, presets, repeatable multi-mode capture, audio, and networking also remain future work.
+Direct Vulkan Video H.264 decode is the next true-zero-copy candidate. It requires rebuilding FFmpeg with Vulkan support and is deliberately a separate phase. VideoToolbox-to-MoltenVK zero-copy on macOS, NVIDIA Image Scaling, compression preprocessing, Nexus Adaptive Detail, presets, repeatable multi-mode capture, audio, and networking also remain future work.
 
 ## Troubleshooting
 
-- **No GLSL-to-SPIR-V compiler:** set `VULKAN_SDK` and confirm its `Bin` directory contains `glslc.exe` or `glslangValidator.exe`.
+- **No GLSL-to-SPIR-V compiler:** set `VULKAN_SDK` and confirm its `Bin` directory contains `glslc.exe` or `glslangValidator.exe`. On macOS, source the SDK's `setup-env.sh`.
 - **FFmpeg development files were not found:** use the manifest toolchain or point `FFMPEG_ROOT` at a development tree containing `include` and `lib` directories.
 - **Missing validation layer:** install the Vulkan SDK or pass `--validation off`; Release defaults to validation off.
+- **No Vulkan physical devices on macOS:** install the LunarG SDK so the MoltenVK ICD is registered under `/usr/local/share/vulkan/icd.d`, and run `--decoder-capabilities` to confirm MoltenVK is selected.
 - **Unsupported color metadata:** inspect recorded inputs with `scripts/validate-samples.ps1`.
-- **Interop selected but unavailable:** strict `interop` is intentionally unsupported on the tested NVIDIA driver. Use `--decoder-path interop-copy`; run `--decoder-capabilities` to inspect same-GPU LUID, Win32 external-memory, timeline semaphore, and D3D11-fence import support.
+- **Interop selected but unavailable:** strict `interop` is intentionally unsupported on the tested NVIDIA driver. Use `--decoder-path interop-copy`; run `--decoder-capabilities` to inspect same-GPU LUID, Win32 external-memory, timeline semaphore, and D3D11-fence import support. Interop paths are Windows-only.
+- **Bridge build fails on macOS:** `scripts/build-sysdvr-upscaler-bridge.sh` needs a .NET 9 SDK on `PATH` and Homebrew `libusb` (or `LIBUSB_PREFIX`).
 - **Black output or validation errors:** update the GPU driver, run Debug with validation enabled, and capture the selected GPU, decoder format, and frame-storage telemetry.

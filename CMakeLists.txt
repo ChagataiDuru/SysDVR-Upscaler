@@ -55,11 +55,10 @@ if(NS60_BUILD_APP)
   target_include_directories(NexusStream60 SYSTEM PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fidelityfx-fsr1")
   target_compile_definitions(NexusStream60 PRIVATE
     NS60_VERSION="${PROJECT_VERSION}"
-    NS60_DEFAULT_VALIDATION=$<IF:$<BOOL:${NS60_ENABLE_VALIDATION}>,1,0>
-    NOMINMAX WIN32_LEAN_AND_MEAN)
+    NS60_DEFAULT_VALIDATION=$<IF:$<BOOL:${NS60_ENABLE_VALIDATION}>,1,0>)
   if(WIN32)
     target_link_libraries(NexusStream60 PRIVATE d3d11 dxgi d3dcompiler)
-    target_compile_definitions(NexusStream60 PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+    target_compile_definitions(NexusStream60 PRIVATE VK_USE_PLATFORM_WIN32_KHR NOMINMAX WIN32_LEAN_AND_MEAN)
   endif()
   ns60_enable_warnings(NexusStream60)
   include(CompileShaders)
@@ -84,7 +83,14 @@ endif()
 
 
 
-add_custom_target(build_sysdvr_upscaler_bridge
-  COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/scripts/build-sysdvr-upscaler-bridge.ps1"
-  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-  COMMENT "Publishing SysDVR-UpscalerBridge to artifacts/sysdvr-upscaler-bridge/win-x64")
+if(WIN32)
+  add_custom_target(build_sysdvr_upscaler_bridge
+    COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/scripts/build-sysdvr-upscaler-bridge.ps1"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    COMMENT "Publishing SysDVR-UpscalerBridge to artifacts/sysdvr-upscaler-bridge/win-x64")
+elseif(APPLE)
+  add_custom_target(build_sysdvr_upscaler_bridge
+    COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/scripts/build-sysdvr-upscaler-bridge.sh"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    COMMENT "Publishing SysDVR-UpscalerBridge to artifacts/sysdvr-upscaler-bridge/osx-arm64")
+endif()

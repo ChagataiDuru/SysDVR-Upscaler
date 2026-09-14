@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string>
+#include <string_view>
 
 namespace ns60::sysdvr_bridge {
 
@@ -11,6 +13,8 @@ inline constexpr std::size_t HelloHeaderSize = 32;
 inline constexpr std::size_t StreamHeaderSize = 48;
 inline constexpr std::size_t MaxHeaderSize = 256;
 inline constexpr std::uint32_t MaxPayloadSize = 16u * 1024u * 1024u;
+// sockaddr_un::sun_path is 104 bytes on macOS (108 on Linux), including the terminator.
+inline constexpr std::size_t MaxUnixSocketPathSize = 103;
 
 inline constexpr std::uint32_t CapabilityVideo = 1u << 0;
 inline constexpr std::uint32_t CapabilitySourceTimestamp = 1u << 1;
@@ -51,5 +55,8 @@ struct StreamMessageHeader {
 [[nodiscard]] HelloMessage parseHello(std::span<const std::uint8_t> header);
 [[nodiscard]] StreamMessageHeader parseStreamHeader(std::span<const std::uint8_t> header);
 [[nodiscard]] const char* messageTypeName(MessageType type) noexcept;
+// Mirrors .NET's NamedPipeClientStream on Unix, which the bridge uses: a rooted
+// name is the socket path itself, otherwise it is <tempDirectory>/CoreFxPipe_<name>.
+[[nodiscard]] std::string unixSocketPathFor(std::string_view pipeName, std::string_view tempDirectory);
 
 } // namespace ns60::sysdvr_bridge

@@ -138,6 +138,35 @@ std::vector<AVPixelFormat> preferredTransferFormats(AVBufferRef* device) {
     return ordered;
 }
 
+const char* hardwareBackendName(DecoderBackend backend) noexcept {
+    switch (backend) {
+    case DecoderBackend::D3D11VA: return "D3D11VA";
+    case DecoderBackend::VideoToolbox: return "VideoToolbox";
+    case DecoderBackend::Software:
+    case DecoderBackend::Auto: break;
+    }
+    return "hardware";
+}
+
+AVHWDeviceType hardwareDeviceType(DecoderBackend backend) {
+    switch (backend) {
+    case DecoderBackend::D3D11VA: return AV_HWDEVICE_TYPE_D3D11VA;
+    case DecoderBackend::VideoToolbox: return AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
+    case DecoderBackend::Software:
+    case DecoderBackend::Auto: break;
+    }
+    throw std::logic_error(std::format("Decoder backend '{}' has no FFmpeg hardware device", toString(backend)));
+}
+
+// --decoder auto tries the platform's native hardware decoder first.
+constexpr DecoderBackend platformHardwareBackend() noexcept {
+#ifdef __APPLE__
+    return DecoderBackend::VideoToolbox;
+#else
+    return DecoderBackend::D3D11VA;
+#endif
+}
+
 #ifdef _WIN32
 std::string hresultText(HRESULT result) {
     return std::format("HRESULT 0x{:08x}", static_cast<std::uint32_t>(result));
@@ -579,6 +608,41 @@ struct FFmpegVideoReader::Impl {
     std::uint64_t frameNumber{};
     std::int64_t lastPts{AV_NOPTS_VALUE};
     double fallbackPts{};
+    // A live SysDVR stream joins mid-GOP. VideoToolbox cannot conceal the missing
+    // references and reports bad data, so live VideoToolbox decode discards
+    // non-key frames until a keyframe decodes, and re-arms that wait on errors.
+    static constexpr int maxConsecutiveLiveDecodeErrors = 30;
+    bool awaitingLiveKeyframe{};
+    int consecutiveLiveDecodeErrors{};
+
+    [[nodiscard]] bool gatesLiveKeyframes() const noexcept {
+        return liveInput && activeBackend == DecoderBackend::VideoToolbox;
+    }
+
+    void armLiveKeyframeWait() noexcept {
+        if (!gatesLiveKeyframes()) return;
+        awaitingLiveKeyframe = true;
+        codec->skip_frame = AVDISCARD_NONKEY;
+    }
+
+    void releaseLiveKeyframeWait() {
+        consecutiveLiveDecodeErrors = 0;
+        if (!awaitingLiveKeyframe) return;
+        awaitingLiveKeyframe = false;
+        codec->skip_frame = AVDISCARD_DEFAULT;
+        Log::info("VideoToolbox live decode synchronized on a keyframe");
+    }
+
+    // Absorbs a live VideoToolbox decode error by waiting for the next keyframe.
+    // This never switches backends; persistent failure still ends the stream.
+    [[nodiscard]] bool absorbLiveDecodeError(int error) {
+        if (!gatesLiveKeyframes() || !hardwareFormatError.empty()) return false;
+        if (++consecutiveLiveDecodeErrors > maxConsecutiveLiveDecodeErrors) return false;
+        Log::warning(std::format("VideoToolbox rejected live H.264 data ({}); waiting for the next keyframe ({}/{})",
+                                 ffmpegError(error), consecutiveLiveDecodeErrors, maxConsecutiveLiveDecodeErrors));
+        armLiveKeyframeWait();
+        return true;
+    }
 
     explicit Impl(const std::filesystem::path& path, DecoderBackend backend, DecoderPath pathMode,
                   std::size_t retainedFrames)
@@ -819,29 +883,35 @@ struct FFmpegVideoReader::Impl {
         activeBackend = DecoderBackend::Software;
     }
 
-    void configureD3D11VA(const AVCodec* decoder) {
+    void configureHardwareDecoder(const AVCodec* decoder, DecoderBackend backend) {
+        const AVHWDeviceType deviceType = hardwareDeviceType(backend);
+        const char* backendName = hardwareBackendName(backend);
         hardwarePixelFormat = AV_PIX_FMT_NONE;
         for (int index = 0;; ++index) {
             const AVCodecHWConfig* config = avcodec_get_hw_config(decoder, index);
             if (!config) break;
-            if (config->device_type == AV_HWDEVICE_TYPE_D3D11VA &&
+            if (config->device_type == deviceType &&
                 (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) != 0) {
                 hardwarePixelFormat = config->pix_fmt;
                 break;
             }
         }
-        if (hardwarePixelFormat == AV_PIX_FMT_NONE) throw std::runtime_error("FFmpeg H.264 decoder does not expose a D3D11VA hw_device_ctx config");
+        if (hardwarePixelFormat == AV_PIX_FMT_NONE) {
+            throw std::runtime_error(std::format("FFmpeg H.264 decoder does not expose a {} hw_device_ctx config", backendName));
+        }
 
         AVBufferRef* rawDevice{};
-        const int result = av_hwdevice_ctx_create(&rawDevice, AV_HWDEVICE_TYPE_D3D11VA, nullptr, nullptr, 0);
-        if (result < 0) throw std::runtime_error("Failed to create FFmpeg D3D11VA device: " + ffmpegError(result));
+        const int result = av_hwdevice_ctx_create(&rawDevice, deviceType, nullptr, nullptr, 0);
+        if (result < 0) throw std::runtime_error(std::format("Failed to create FFmpeg {} device: {}", backendName, ffmpegError(result)));
         hardwareDevice.reset(rawDevice);
         if (requestedPath == DecoderPath::Readback) {
             transferFormats = preferredTransferFormats(hardwareDevice.get());
-            if (transferFormats.empty()) throw std::runtime_error("D3D11VA device exposes no CPU transfer format usable by the owned YUV420 frame path");
+            if (transferFormats.empty()) {
+                throw std::runtime_error(std::format("{} device exposes no CPU transfer format usable by the owned YUV420 frame path", backendName));
+            }
         }
 #ifdef _WIN32
-        if (usesD3D11VulkanInterop(requestedPath)) {
+        if (backend == DecoderBackend::D3D11VA && usesD3D11VulkanInterop(requestedPath)) {
             auto* deviceContext = reinterpret_cast<AVHWDeviceContext*>(hardwareDevice->data);
             auto* d3d11Context = static_cast<AVD3D11VADeviceContext*>(deviceContext->hwctx);
             interopRuntime = std::make_shared<D3D11InteropRuntime>(*d3d11Context);
@@ -852,7 +922,7 @@ struct FFmpegVideoReader::Impl {
         if (!codec->hw_device_ctx) throw std::bad_alloc();
         codec->opaque = this;
         codec->get_format = getHardwareFormat;
-        activeBackend = DecoderBackend::D3D11VA;
+        activeBackend = backend;
     }
 
     void openSoftwareDecoder(const AVCodec* decoder) {
@@ -863,13 +933,18 @@ struct FFmpegVideoReader::Impl {
         activeBackend = DecoderBackend::Software;
     }
 
-    void openD3D11Decoder(const AVCodec* decoder) {
+    void openHardwareDecoder(const AVCodec* decoder, DecoderBackend backend) {
         resetHardwareState();
         allocateCodecContext(decoder);
-        configureD3D11VA(decoder);
+        // VideoToolbox decodes on the media engine; frame threads only add latency
+        // and report a rejected frame on a later packet than the one that caused it.
+        if (backend == DecoderBackend::VideoToolbox) codec->thread_count = 1;
+        configureHardwareDecoder(decoder, backend);
         const int result = avcodec_open2(codec.get(), decoder, nullptr);
-        if (result < 0) throw std::runtime_error("Failed to open H.264 D3D11VA decoder: " + ffmpegError(result));
-        activeBackend = DecoderBackend::D3D11VA;
+        if (result < 0) {
+            throw std::runtime_error(std::format("Failed to open H.264 {} decoder: {}", hardwareBackendName(backend), ffmpegError(result)));
+        }
+        activeBackend = backend;
     }
 
     void openSelectedDecoder(const AVCodec* decoder) {
@@ -878,18 +953,21 @@ struct FFmpegVideoReader::Impl {
             return;
         }
 
+        const DecoderBackend hardwareBackend =
+            requestedBackend == DecoderBackend::Auto ? platformHardwareBackend() : requestedBackend;
         try {
-            openD3D11Decoder(decoder);
+            openHardwareDecoder(decoder, hardwareBackend);
             return;
         } catch (const std::exception& error) {
-            if (requestedBackend == DecoderBackend::D3D11VA) throw;
-            Log::warning(std::string("D3D11VA decoder unavailable; falling back to software: ") + error.what());
+            if (requestedBackend != DecoderBackend::Auto) throw;
+            Log::warning(std::format("{} decoder unavailable; falling back to software: {}",
+                                     hardwareBackendName(hardwareBackend), error.what()));
             openSoftwareDecoder(decoder);
         }
     }
 
     std::string advertisedPixelFormatName(AVPixelFormat containerPixelFormat) const {
-        if (activeBackend == DecoderBackend::D3D11VA) {
+        if (isHardwareBackend(activeBackend)) {
             if (requestedPath == DecoderPath::D3D11VulkanInterop) return "d3d11 / D3D11 NV12";
             if (requestedPath == DecoderPath::D3D11VulkanInteropCopy) return "d3d11 / D3D11 NV12 (GPU copy)";
             const AVPixelFormat transferFormat = successfulTransferFormat.value_or(transferFormats.empty() ? AV_PIX_FMT_NONE : transferFormats.front());
@@ -915,6 +993,7 @@ struct FFmpegVideoReader::Impl {
         }
 
         openSelectedDecoder(decoder);
+        armLiveKeyframeWait();
 
         const auto pixelFormat = static_cast<AVPixelFormat>(stream->codecpar->format);
         if (pixelFormat != AV_PIX_FMT_YUV420P && pixelFormat != AV_PIX_FMT_YUVJ420P && pixelFormat != AV_PIX_FMT_NONE) {
@@ -977,9 +1056,10 @@ struct FFmpegVideoReader::Impl {
             return result;
         };
 
+        const char* backendName = hardwareBackendName(activeBackend);
         if (successfulTransferFormat) {
             const int result = tryTransfer(*successfulTransferFormat);
-            if (result < 0) throw std::runtime_error("D3D11VA frame transfer failed: " + ffmpegError(result));
+            if (result < 0) throw std::runtime_error(std::format("{} frame transfer failed: {}", backendName, ffmpegError(result)));
             return transferFrame.get();
         }
 
@@ -988,20 +1068,22 @@ struct FFmpegVideoReader::Impl {
             lastError = tryTransfer(transferFormat);
             if (lastError >= 0) return transferFrame.get();
         }
-        throw std::runtime_error("D3D11VA frame transfer failed for all CPU formats: " + ffmpegError(lastError));
+        throw std::runtime_error(std::format("{} frame transfer failed for all CPU formats: {}", backendName, ffmpegError(lastError)));
     }
 
     AVFrame* materializeFrame() {
         const auto decodedFormat = static_cast<AVPixelFormat>(frame->format);
-        if (activeBackend == DecoderBackend::D3D11VA && decodedFormat == hardwarePixelFormat) {
+        if (isHardwareBackend(activeBackend) && decodedFormat == hardwarePixelFormat) {
             if (usesD3D11VulkanInterop(requestedPath)) return frame.get();
             return transferHardwareFrame();
         }
-        if (activeBackend == DecoderBackend::D3D11VA && requestedBackend == DecoderBackend::D3D11VA) {
-            throw std::runtime_error("D3D11VA was requested but FFmpeg returned a non-hardware frame format '" + pixelFormatName(decodedFormat) + "'");
+        if (isHardwareBackend(activeBackend) && requestedBackend == activeBackend) {
+            throw std::runtime_error(std::format("{} was requested but FFmpeg returned a non-hardware frame format '{}'",
+                                                 hardwareBackendName(activeBackend), pixelFormatName(decodedFormat)));
         }
-        if (activeBackend == DecoderBackend::D3D11VA && requestedBackend == DecoderBackend::Auto) {
-            Log::warning("D3D11VA auto path returned software frames; continuing with software frame copies");
+        if (isHardwareBackend(activeBackend) && requestedBackend == DecoderBackend::Auto) {
+            Log::warning(std::format("{} auto path returned software frames; continuing with software frame copies",
+                                     hardwareBackendName(activeBackend)));
             activeBackend = DecoderBackend::Software;
             streamInfo.activeDecoderBackend = activeBackend;
         }
@@ -1043,6 +1125,7 @@ struct FFmpegVideoReader::Impl {
         while (true) {
             int result = avcodec_receive_frame(codec.get(), frame.get());
             if (result == 0) {
+                releaseLiveKeyframeWait();
                 AVFrame* outputFrame = materializeFrame();
                 const auto outputFormat = static_cast<AVPixelFormat>(outputFrame->format);
                 const bool interopFrame = usesD3D11VulkanInterop(requestedPath);
@@ -1121,6 +1204,7 @@ struct FFmpegVideoReader::Impl {
             }
             if (result == AVERROR_EOF) return ReadFrameResult::EndOfFile;
             if (result != AVERROR(EAGAIN)) {
+                if (absorbLiveDecodeError(result)) continue;
                 if (!hardwareFormatError.empty()) throw std::runtime_error("D3D11VA format setup failed: " + hardwareFormatError);
                 throw std::runtime_error("H.264 decoder receive failed: " + ffmpegError(result));
             }
@@ -1141,6 +1225,7 @@ struct FFmpegVideoReader::Impl {
                 result = avcodec_send_packet(codec.get(), packet.get());
                 av_packet_unref(packet.get());
                 if (result < 0) {
+                    if (absorbLiveDecodeError(result)) continue;
                     if (!hardwareFormatError.empty()) {
                         throw std::runtime_error("D3D11VA format setup failed: " + hardwareFormatError);
                     }
