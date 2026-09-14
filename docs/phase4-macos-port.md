@@ -49,7 +49,9 @@ The bridge opens its endpoint with .NET's `NamedPipeClientStream`, which is a Un
 
 The server binds a `SOCK_STREAM` socket, restricts it to mode 0600, listens for one client, and accepts on the decoder thread just as `ConnectNamedPipe` does on Windows. A leftover socket file from an earlier run is replaced, any other file type at that path is refused, and the socket is unlinked on shutdown. Reads retry on `EINTR`; end of stream or `ECONNRESET` is a normal disconnect.
 
-The managed launch uses `posix_spawn` with an argument vector, the bridge's directory as working directory, and its own process group, mirroring `CREATE_NEW_PROCESS_GROUP`. Stopping sends `SIGTERM` so the bridge can release the USB device, waits up to 3 s, then sends `SIGKILL`.
+The managed launch uses `posix_spawn` with an argument vector, the bridge's directory as working directory, and its own process group, mirroring `CREATE_NEW_PROCESS_GROUP`. The bridge's stdin is `/dev/null`, like `CREATE_NO_WINDOW` on Windows. When launched from an interactive terminal, the bridge inherited the terminal as stdin, and its console probing (`Console.KeyAvailable`) from a background process group got it stopped by the terminal (process state `T`) before it connected, leaving NexusStream60 waiting on the socket. Stopping sends `SIGTERM` so the bridge can release the USB device, waits up to 3 s, then sends `SIGKILL`.
+
+Quit with `Escape` or by closing the window. `Ctrl+C` in the terminal ends NexusStream60 without running that shutdown, so the bridge keeps running and holding the USB device until it is killed. This matches the current Windows behavior; handling `SIGINT` as a window close is a listed improvement.
 
 ## VideoToolbox readback
 
@@ -86,4 +88,4 @@ Ordered by expected value, based on the live VideoToolbox telemetry above.
 6. **Retina presentation.** `--presentation exact` shows a 1920×1080 output as 960×540 points on a 2880×1800 panel. Consider HiDPI-aware integer scaling or a macOS default of `fit`, and reconstruction targets matched to Retina resolutions (for example 2880×1620).
 7. **Hardware validation still owed.** A Release-build live session, USB disconnect/reconnect, visual comparison against Windows, and the 30-minute soak.
 8. **Packaging.** Shaders load from the absolute `NS60_SHADER_DIR` in the build tree, and Vulkan relies on the SDK's ICD registration and `setup-env.sh`. A relocatable `.app` would bundle shaders, the loader, MoltenVK, and the bridge, with ad-hoc or Developer ID signing.
-9. **Small cleanups.** Replace the misleading "YUV420P input dimensions" error for an empty live stream. Remove dead-process `ns60-*.sock` files at startup (managed socket names are unique, so a crashed run's socket is never reused). Drop the duplicate GLFW link reported by `ld`.
+9. **Small cleanups.** Treat `SIGINT`/`SIGTERM` as a window-close request, so `Ctrl+C` in the terminal still stops the managed bridge and removes its socket (the same gap exists for console Ctrl+C on Windows). Replace the misleading "YUV420P input dimensions" error for an empty live stream. Remove dead-process `ns60-*.sock` files at startup (managed socket names are unique, so a crashed run's socket is never reused). Drop the duplicate GLFW link reported by `ld`.

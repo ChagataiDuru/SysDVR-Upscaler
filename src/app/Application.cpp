@@ -40,6 +40,7 @@
 #include <cerrno>
 #include <csignal>
 #include <cstdlib>
+#include <fcntl.h>
 #include <spawn.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -328,6 +329,13 @@ BridgeProcess launchSysDvrBridge(const AppConfig& config) {
     if (const int result = posix_spawn_file_actions_addchdir_np(&actions, workingDirectory.c_str()); result != 0) {
         cleanup();
         throw std::runtime_error(std::format("Failed to set the SysDVR bridge working directory: {}", std::strerror(result)));
+    }
+    // The bridge runs in a background process group. If it inherited a terminal
+    // stdin, its console probing would get it stopped by SIGTTIN/SIGTTOU before
+    // it connects, so give it no console input, like CREATE_NO_WINDOW on Windows.
+    if (const int result = posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0); result != 0) {
+        cleanup();
+        throw std::runtime_error(std::format("Failed to redirect SysDVR bridge input: {}", std::strerror(result)));
     }
     // Own process group, like CREATE_NEW_PROCESS_GROUP: terminal Ctrl+C reaches
     // only NexusStream60, which then stops the bridge itself.
